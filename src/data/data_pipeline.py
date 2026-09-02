@@ -74,6 +74,17 @@ def download_all_data(data_years):
             gp_session.results.to_csv(os.path.join(RAW_DATA_PATH, data_file_name), index=False)
             print(f"   - Saved results to [green]{RAW_DATA_PATH}/{data_file_name}[/green]\n")
 
+            # Qualifying sets the main race grid every weekend, sprint or not, so this is
+            # unconditional (unlike the sprint session below).
+            q_session = download_session(year, round, 'Q')
+
+            if q_session is None or q_session.results is None or q_session.results.empty:
+                print(f"   - [yellow]WARNING[/yellow]: No qualifying results data returned for [red]Round {round} - {loc}[/red], skipping...\n")
+            else:
+                qualifying_file_name = f'{year}_Round_{round}_{loc}_qualifying_results.csv'
+                q_session.results.to_csv(os.path.join(RAW_DATA_PATH, qualifying_file_name), index=False)
+                print(f"   - Saved qualifying results to [green]{RAW_DATA_PATH}/{qualifying_file_name}[/green]\n")
+
             if is_sprint:
                 s_session = download_session(year, round, 'S')
 
@@ -88,7 +99,9 @@ def download_all_data(data_years):
     print(f"Data download completed in {time.time() - download_start_time:.2f} seconds")
 
 # -------------------- PREPROCESS FUNCTIONS --------------------
-RAW_FILENAME_PATTERN = re.compile(r"^(?P<year>\d{4})_Round_(?P<round>\d+)_(?P<location>.+?)_(?P<kind>results|sprint_results)\.csv$")
+RAW_FILENAME_PATTERN = re.compile(r"^(?P<year>\d{4})_Round_(?P<round>\d+)_(?P<location>.+?)_(?P<kind>results|sprint_results|qualifying_results)\.csv$")
+
+EVENT_BY_KIND = {'sprint_results': 'Sprint', 'qualifying_results': 'Qualifying', 'results': 'Race'}
 
 def parse_raw_filename(filename: str):
     match = RAW_FILENAME_PATTERN.match(filename)
@@ -98,6 +111,15 @@ def parse_raw_filename(filename: str):
 
 def get_data_files_for_year(year: str, raw_data_files):
     return [file for file in raw_data_files if file.startswith(str(year))]
+
+def split_files_by_kind(file_list: list):
+    """Qualifying files are kept separate from Race/Sprint - mixing them into the same combined
+    per-round aggregation would corrupt the Points/DNF sums those race-result features rely on."""
+    race_and_sprint_files, qualifying_files = [], []
+    for file in file_list:
+        _, _, _, kind = parse_raw_filename(file)
+        (qualifying_files if kind == 'qualifying_results' else race_and_sprint_files).append(file)
+    return race_and_sprint_files, qualifying_files
 
 def combine_data_files_for_year(file_list: list):
     year_data_df = pd.DataFrame()
@@ -109,7 +131,7 @@ def combine_data_files_for_year(file_list: list):
 
         file_df.insert(loc=0, column='Year', value=file_year)
         file_df.insert(loc=1, column='Round', value=gp_round)
-        file_df.insert(loc=2, column='Event', value='Sprint' if kind == 'sprint_results' else 'Race')
+        file_df.insert(loc=2, column='Event', value=EVENT_BY_KIND[kind])
         file_df.insert(loc=3, column='Location', value=gp_location)
         year_data_df = pd.concat([year_data_df, file_df], ignore_index=True)
 
@@ -127,6 +149,7 @@ def preprocess_all_data(years):
     print("Starting data preprocessing...")
 
     all_data_df = pd.DataFrame()
+    all_qualifying_df = pd.DataFrame()
     raw_data_files = os.listdir(RAW_DATA_PATH)
 
     os.makedirs(PREPROCESSED_DATA_PATH, exist_ok=True)
@@ -134,22 +157,57 @@ def preprocess_all_data(years):
     for year in years:
         print(f" > Processing data for the {year} season")
         files = get_data_files_for_year(year, raw_data_files)
-        year_df = combine_data_files_for_year(files)
+        race_and_sprint_files, qualifying_files = split_files_by_kind(files)
+
+        year_df = combine_data_files_for_year(race_and_sprint_files)
         all_data_df = pd.concat([all_data_df, year_df], ignore_index=True)
         preprocessed_file_name = f'{year}_season_results.csv'
         year_df.to_csv(os.path.join(PREPROCESSED_DATA_PATH, preprocessed_file_name), index=False)
         print(f"   - Saved preprocessed data to [magenta]{PREPROCESSED_DATA_PATH}/{preprocessed_file_name}[/magenta]\n")
 
+        if qualifying_files:
+            qualifying_year_df = combine_data_files_for_year(qualifying_files)
+            all_qualifying_df = pd.concat([all_qualifying_df, qualifying_year_df], ignore_index=True)
+            qualifying_file_name = f'{year}_qualifying_results.csv'
+            qualifying_year_df.to_csv(os.path.join(PREPROCESSED_DATA_PATH, qualifying_file_name), index=False)
+            print(f"   - Saved preprocessed qualifying data to [magenta]{PREPROCESSED_DATA_PATH}/{qualifying_file_name}[/magenta]\n")
+
     print("Gathering data on drivers...")
 
-    unique_drivers = all_data_df['DriverId'].unique()
-    drivers_df = autofill_driver_data_given_id(all_data_df, unique_drivers, 'DriverId')
+    # Union with qualifying in case a driver only ever appears there (e.g. DSQ'd in qualifying,
+    # never started the race).
+    all_known_results_df = pd.concat([all_data_df, all_qualifying_df], ignore_index=True) if not all_qualifying_df.empty else all_data_df
+    unique_drivers = all_known_results_df['DriverId'].unique()
+    drivers_df = autofill_driver_data_given_id(all_known_results_df, unique_drivers, 'DriverId')
     drivers_df.to_csv(os.path.join(PREPROCESSED_DATA_PATH, 'drivers.csv'), index=False)
 
     print(f"   - Saved drivers data to [magenta]{PREPROCESSED_DATA_PATH}/drivers.csv[/magenta]\n")
     print("Data preprocessing completed.")
 
 # -------------------- FEATURE ENGINEERING FUNCTIONS --------------------
+# fastf1's Status field is free text ("Accident", "Collision damage", "Spun off", "Engine",
+# "Gearbox", "Retired", etc.) - matched by substring since exact wording varies ("Collision"
+# vs "Collision damage"). IMPORTANT CAVEAT: in practice the large majority of DNFs (~83% in a
+# 2024 spot check) are just labeled generic "Retired" with no further detail - fastf1's results
+# endpoint doesn't reliably specify cause beyond a handful of explicit cases, so DriverFaultDNFRate/
+# MechanicalDNFRate below are a lower bound on true driver-fault frequency (verified against 2024
+# Australian GP: Verstappen's brake-fire and Hamilton's hydraulics failure are genuinely mechanical
+# and correctly bucketed, but Russell's crash that race - caused by a mechanical failure - is also
+# just "Retired", indistinguishable in the data from the other two), not a precise attribution.
+# Disqualifications are kept as their own neutral category rather than Driver-fault, since DSQs are
+# more often a car-legality issue (e.g. plank wear, illegal fuel) than driver misconduct.
+DRIVER_FAULT_STATUS_KEYWORDS = ("accident", "collision", "spun off")
+
+def classify_dnf_cause(row):
+    if row["isDNF"] == 0:
+        return "Finished"
+    status = str(row["Status"]).strip().lower()
+    if "disqualified" in status:
+        return "Disqualified"
+    if any(keyword in status for keyword in DRIVER_FAULT_STATUS_KEYWORDS):
+        return "Driver"
+    return "Mechanical"
+
 def normalize_teamids(df: pd.DataFrame):
     df["TeamId"] = df["TeamId"].replace("alfa", "sauber")
     df["TeamId"] = df["TeamId"].replace("renault", "alpine")
@@ -168,11 +226,40 @@ def build_round_summary_by_driver(all_seasons_data_df: pd.DataFrame):
             Location=("Location", "first"),
             PointsEarnedThisRound=("Points", "sum"),
             DNFsThisRound=("isDNF", "sum"),
+            DriverFaultDNFsThisRound=("isDriverFaultDNF", "sum"),
+            MechanicalDNFsThisRound=("isMechanicalDNF", "sum"),
             GridPosition=("GridPosition", "mean"),
             Position=("Position", "mean"),
         )
     )
     return round_summary
+
+def build_qualifying_summary_by_driver(all_seasons_qualifying_df: pd.DataFrame):
+    """One row per (Year, TeamId, DriverId, Round) of qualifying position - kept separate from the
+    Race/Sprint round summary since it's a different session with its own result grain."""
+    if all_seasons_qualifying_df.empty:
+        return pd.DataFrame(columns=["Year", "TeamId", "DriverId", "Round", "QualifyingPosition"])
+
+    return (
+        all_seasons_qualifying_df
+        .groupby(["Year", "TeamId", "DriverId", "Round"], as_index=False)
+        .agg(QualifyingPosition=("Position", "mean"))
+    )
+
+def add_qualifying_teammate_gap(round_summary: pd.DataFrame):
+    """Same self-join pattern as add_teammate_features, but run on round_summary AFTER
+    QualifyingPosition has already had its GridPosition fallback applied (see
+    feature_engineer_all_data), so a missing-qualifying-data gap doesn't also blank out the
+    teammate comparison. A row with no teammate at all that round still legitimately gets NaN."""
+    merged = round_summary.merge(round_summary, on=["Year", "TeamId", "Round"], suffixes=("", "_Teammate"))
+    merged = merged[merged["DriverId"] != merged["DriverId_Teammate"]]
+    merged = merged.sort_values(["Year", "TeamId", "Round", "DriverId", "DriverId_Teammate"])
+    merged = merged.drop_duplicates(subset=["Year", "TeamId", "Round", "DriverId"], keep="first")
+
+    teammate_df = merged[["Year", "TeamId", "Round", "DriverId", "QualifyingPosition_Teammate"]]
+    teammate_df = teammate_df.rename(columns={"QualifyingPosition_Teammate": "TeammateQualifyingPosition"})
+
+    return round_summary.merge(teammate_df, on=["Year", "TeamId", "Round", "DriverId"], how="left")
 
 def add_teammate_features(round_summary: pd.DataFrame):
     """Looks up whichever other driver raced for the same team/round to derive teammate-comparison features."""
@@ -280,8 +367,10 @@ def calculate_driver_standings_context(training_data_df: pd.DataFrame):
 
 FINAL_COLUMNS = ["Year", "DriverId", "TeamId", "Location", "Round", "RoundsCompleted", "RoundsRemaining", \
                  "CareerSeasonsRaced", "CareerRoundsRaced", "TeamSeasonsWithCurrentTeam", "TeamRoundsWithCurrentTeam", \
-                 "PointsEarnedThisRound", "DNFsThisRound", "TeammateId", "TeammatePointsGap", "BeatTeammateThisRound", \
-                 "BeatTeammateRate", "PositionsGainedThisRound", "AvgPositionsGained", "PointsLast3Rounds", \
+                 "PointsEarnedThisRound", "DNFsThisRound", "DriverFaultDNFsThisRound", "MechanicalDNFsThisRound", \
+                 "DriverFaultDNFRate", "MechanicalDNFRate", "TeammateId", "TeammatePointsGap", "BeatTeammateThisRound", \
+                 "BeatTeammateRate", "PositionsGainedThisRound", "AvgPositionsGained", "HasQualifyingData", \
+                 "QualifyingPosition", "AvgQualifyingPosition", "QualifyingGapToTeammate", "GridPenaltyPositions", "PointsLast3Rounds", \
                  "DNFsLast3Rounds", "DNFRate", "AvgGridPosition", "AvgPosition", "AvgPointsPerRace", \
                  "TotalPointFinishes", "FormRatio", "Consistency", "TotalPodiums", "TotalPoints", \
                  "ProjectedSeasonTotalPoints", "RelativePointsShare", "CurrentRankAfterRound", "PercentileRankAfterRound", \
@@ -297,10 +386,14 @@ def feature_engineer_all_data(years, incomplete_years=None, min_rounds=3):
     years = sorted(years)
 
     all_seasons_data_df = pd.DataFrame()
+    all_seasons_qualifying_df = pd.DataFrame()
     preprocessed_files = os.listdir(PREPROCESSED_DATA_PATH)
 
     for file in preprocessed_files:
-        if file.endswith("_season_results.csv"):
+        if file.endswith("_qualifying_results.csv"):
+            current_year_qualifying_df = pd.read_csv(os.path.join(PREPROCESSED_DATA_PATH, file))
+            all_seasons_qualifying_df = pd.concat([all_seasons_qualifying_df, current_year_qualifying_df])
+        elif file.endswith("_season_results.csv"):
             current_year_df = pd.read_csv(os.path.join(PREPROCESSED_DATA_PATH, file))
             all_seasons_data_df = pd.concat([all_seasons_data_df, current_year_df])
 
@@ -309,6 +402,13 @@ def feature_engineer_all_data(years, incomplete_years=None, min_rounds=3):
     all_seasons_data_df["isDNF"] = all_seasons_data_df["ClassifiedPosition"].apply(lambda x: 1 if not str(x).isnumeric() else 0)
     all_seasons_data_df["isPointsFinish"] = all_seasons_data_df["Points"].apply(lambda x: 1 if x > 0 else 0)
     all_seasons_data_df["isPodiumFinish"] = all_seasons_data_df["Points"].apply(lambda x: 1 if x >= 15 else 0)
+    all_seasons_data_df["DNFCause"] = all_seasons_data_df.apply(classify_dnf_cause, axis=1)
+    all_seasons_data_df["isDriverFaultDNF"] = (all_seasons_data_df["DNFCause"] == "Driver").astype(int)
+    all_seasons_data_df["isMechanicalDNF"] = (all_seasons_data_df["DNFCause"] == "Mechanical").astype(int)
+
+    if not all_seasons_qualifying_df.empty:
+        all_seasons_qualifying_df = all_seasons_qualifying_df.sort_values(by=["Year", "Round", "Position"]).reset_index(drop=True)
+        all_seasons_qualifying_df = normalize_teamids(all_seasons_qualifying_df)
 
     final_standings_df = all_seasons_data_df.groupby(["Year", "DriverId"], as_index=False).agg(
         FullName=("FullName", "first"),
@@ -318,6 +418,18 @@ def feature_engineer_all_data(years, incomplete_years=None, min_rounds=3):
     round_summary = build_round_summary_by_driver(all_seasons_data_df)
     round_summary = add_teammate_features(round_summary)
     team_context_df = calculate_team_context_features(all_seasons_data_df)
+
+    qualifying_summary = build_qualifying_summary_by_driver(all_seasons_qualifying_df)
+    round_summary = round_summary.merge(
+        qualifying_summary[["Year", "TeamId", "DriverId", "Round", "QualifyingPosition"]],
+        on=["Year", "TeamId", "DriverId", "Round"],
+        how="left",
+    )
+    round_summary["HasQualifyingData"] = round_summary["QualifyingPosition"].notna().astype(int)
+    # Fall back to GridPosition ("assume no penalty") when qualifying wasn't downloaded for this
+    # year/round - HasQualifyingData lets the model tell that apart from a genuine zero-penalty.
+    round_summary["QualifyingPosition"] = round_summary["QualifyingPosition"].fillna(round_summary["GridPosition"])
+    round_summary = add_qualifying_teammate_gap(round_summary)
 
     training_data_df = pd.DataFrame()
     incomplete_training_data_df = pd.DataFrame()
@@ -395,6 +507,8 @@ def feature_engineer_all_data(years, incomplete_years=None, min_rounds=3):
             driver_rounds_df["AvgGridPosition"] = driver_rounds_df["GridPosition"].expanding().mean()
             driver_rounds_df["AvgPosition"] = driver_rounds_df["Position"].expanding().mean()
             driver_rounds_df["DNFRate"] = driver_rounds_df["DNFsThisRound"].apply(lambda x: 1 if x > 0 else 0).expanding().mean()
+            driver_rounds_df["DriverFaultDNFRate"] = driver_rounds_df["DriverFaultDNFsThisRound"].apply(lambda x: 1 if x > 0 else 0).expanding().mean()
+            driver_rounds_df["MechanicalDNFRate"] = driver_rounds_df["MechanicalDNFsThisRound"].apply(lambda x: 1 if x > 0 else 0).expanding().mean()
             driver_rounds_df["AvgPointsPerRace"] = driver_rounds_df["PointsEarnedThisRound"].expanding().mean()
             driver_rounds_df["TotalPointFinishes"] = (driver_rounds_df["PointsEarnedThisRound"] > 0).astype(int).cumsum()
             driver_rounds_df["TotalPodiums"] = (driver_rounds_df["PointsEarnedThisRound"] >= 15).astype(int).cumsum()
@@ -417,6 +531,13 @@ def feature_engineer_all_data(years, incomplete_years=None, min_rounds=3):
 
             driver_rounds_df["PositionsGainedThisRound"] = driver_rounds_df["GridPosition"] - driver_rounds_df["Position"]
             driver_rounds_df["AvgPositionsGained"] = driver_rounds_df["PositionsGainedThisRound"].expanding().mean()
+
+            driver_rounds_df["AvgQualifyingPosition"] = driver_rounds_df["QualifyingPosition"].expanding().mean()
+            # Positive = qualified better than teammate, matching TeammatePointsGap's "positive is good" convention.
+            driver_rounds_df["QualifyingGapToTeammate"] = driver_rounds_df["TeammateQualifyingPosition"] - driver_rounds_df["QualifyingPosition"]
+            # Positive = started further back than qualified (a grid penalty applied); requires
+            # qualifying data to be present, so this is NaN for any year downloaded without it.
+            driver_rounds_df["GridPenaltyPositions"] = driver_rounds_df["GridPosition"] - driver_rounds_df["QualifyingPosition"]
 
             driver_rounds_df["FinalRank"] = current_year_standings.loc[current_year_standings["DriverId"] == driver_id, "FinalRanking"].iloc[0]
 
