@@ -10,24 +10,48 @@ import pandas as pd
 import re
 import time
 
+from fastf1.exceptions import RateLimitExceededError
+
 # -------------------- DOWNLOAD FUNCTIONS --------------------
 def download_schedule(year: int, include_testing: bool = False):
     schedule = fastf1.get_event_schedule(year, include_testing=include_testing)
     return schedule
 
-def download_session(year: int, gp, session_type: str = 'R', max_retries: int = 3, retry_delay: int = 5):
-    for attempt in range(max_retries):
+# fastf1 self-imposes a hard, sliding-window "500 calls/h across all APIs" limit (see
+# fastf1/req.py) to avoid getting the whole project rate-limited or blocked upstream. A 20s retry
+# is useless against an hourly window, so a genuine rate-limit hit gets a long cooldown instead of
+# the normal short retry_delay - and we deliberately do NOT try to dodge this by restarting the
+# process to reset fastf1's in-memory counter, since that defeats the point of the limiter.
+def download_session(year: int, gp, session_type: str = 'R', max_retries: int = 3, retry_delay: int = 20, \
+                      rate_limit_max_retries: int = 6, rate_limit_cooldown: int = 1200):
+    # Rate-limit retries get their own generous budget, separate from the short generic-error
+    # retry budget - a rate-limit hit consuming one of only 3 generic attempts would give up
+    # after 3 cooldowns even though rate_limit_max_retries says we should allow more.
+    generic_attempts = 0
+    rate_limit_attempts = 0
+    while True:
         try:
             session = fastf1.get_session(year, gp, session_type)
-            session.load()
+            # We only ever use session.results - lap timing/telemetry/weather/messages are the
+            # bulk of the API calls fastf1 otherwise makes per session, and are never touched
+            # downstream, so skipping them is most of the fix for hitting API rate limits.
+            session.load(laps=False, telemetry=False, weather=False, messages=False)
             return session
-        except Exception as e:
-            print(f"   - [yellow]WARNING[/yellow]: Error downloading session (attempt {attempt+1}/{max_retries}): {e}")
-            if attempt < max_retries - 1:
-                time.sleep(retry_delay)
-            else:
-                print(f"   - [red]ERROR[/red]: Failed to download after {max_retries} attempts.")
+        except RateLimitExceededError as e:
+            rate_limit_attempts += 1
+            if rate_limit_attempts >= rate_limit_max_retries:
+                print(f"   - [red]ERROR[/red]: Still rate-limited after {rate_limit_attempts} cooldowns, giving up on this session.")
                 return None
+            print(f"   - [yellow]WARNING[/yellow]: Hit fastf1's API rate limit ({e}). Cooling down for {rate_limit_cooldown}s "
+                  f"(cooldown {rate_limit_attempts}/{rate_limit_max_retries})...")
+            time.sleep(rate_limit_cooldown)
+        except Exception as e:
+            generic_attempts += 1
+            if generic_attempts >= max_retries:
+                print(f"   - [red]ERROR[/red]: Failed to download after {generic_attempts} attempts: {e}")
+                return None
+            print(f"   - [yellow]WARNING[/yellow]: Error downloading session (attempt {generic_attempts}/{max_retries}): {e}")
+            time.sleep(retry_delay)
 
 def get_locations_from_schedule(schedule):
     return schedule['Location'].tolist()
@@ -38,6 +62,8 @@ def get_locations_with_sprint_from_schedule(schedule):
 
 def get_rounds_from_schedule(schedule):
     return schedule['RoundNumber'].tolist()
+
+REQUEST_PACING_DELAY = 2  # seconds between rounds, on top of skipping unneeded session data
 
 def download_all_data(data_years):
     os.makedirs(DATA_PATH, exist_ok=True)
@@ -63,38 +89,60 @@ def download_all_data(data_years):
         for round in schedule_rounds:
             loc = schedule_locations[round - 1]
             is_sprint = loc in sprint_locations
-            print(f" > Downloading data for Round {round} - {loc} | Is a Sprint Event? {is_sprint}")
-            gp_session = download_session(year, round, 'R')
-
-            if gp_session is None or gp_session.results is None or gp_session.results.empty:
-                print(f"   - [yellow]WARNING[/yellow]: No race results data returned for [red]Round {round} - {loc}[/red], skipping...\n")
-                continue
+            print(f" > Round {round} - {loc} | Is a Sprint Event? {is_sprint}")
 
             data_file_name = f'{year}_Round_{round}_{loc}_results.csv'
-            gp_session.results.to_csv(os.path.join(RAW_DATA_PATH, data_file_name), index=False)
-            print(f"   - Saved results to [green]{RAW_DATA_PATH}/{data_file_name}[/green]\n")
+            qualifying_file_name = f'{year}_Round_{round}_{loc}_qualifying_results.csv'
+            sprint_file_name = f'{year}_Round_{round}_{loc}_sprint_results.csv'
+
+            needs_race = not os.path.exists(os.path.join(RAW_DATA_PATH, data_file_name))
+            needs_qualifying = not os.path.exists(os.path.join(RAW_DATA_PATH, qualifying_file_name))
+            needs_sprint = is_sprint and not os.path.exists(os.path.join(RAW_DATA_PATH, sprint_file_name))
+
+            if not (needs_race or needs_qualifying or needs_sprint):
+                print(f"   - Already downloaded, skipping (no API calls made)\n")
+                continue
+
+            # A small cushion between rounds that need real requests, on top of skipping
+            # telemetry/laps/weather above - spaces out request bursts rather than relying
+            # solely on reactive retry/backoff.
+            time.sleep(REQUEST_PACING_DELAY)
+
+            if needs_race:
+                gp_session = download_session(year, round, 'R')
+
+                if gp_session is None or gp_session.results is None or gp_session.results.empty:
+                    print(f"   - [yellow]WARNING[/yellow]: No race results data returned for [red]Round {round} - {loc}[/red], skipping...\n")
+                    continue
+
+                gp_session.results.to_csv(os.path.join(RAW_DATA_PATH, data_file_name), index=False)
+                print(f"   - Saved results to [green]{RAW_DATA_PATH}/{data_file_name}[/green]\n")
+            else:
+                print(f"   - Race results already downloaded, skipping\n")
 
             # Qualifying sets the main race grid every weekend, sprint or not, so this is
             # unconditional (unlike the sprint session below).
-            q_session = download_session(year, round, 'Q')
+            if needs_qualifying:
+                q_session = download_session(year, round, 'Q')
 
-            if q_session is None or q_session.results is None or q_session.results.empty:
-                print(f"   - [yellow]WARNING[/yellow]: No qualifying results data returned for [red]Round {round} - {loc}[/red], skipping...\n")
+                if q_session is None or q_session.results is None or q_session.results.empty:
+                    print(f"   - [yellow]WARNING[/yellow]: No qualifying results data returned for [red]Round {round} - {loc}[/red], skipping...\n")
+                else:
+                    q_session.results.to_csv(os.path.join(RAW_DATA_PATH, qualifying_file_name), index=False)
+                    print(f"   - Saved qualifying results to [green]{RAW_DATA_PATH}/{qualifying_file_name}[/green]\n")
             else:
-                qualifying_file_name = f'{year}_Round_{round}_{loc}_qualifying_results.csv'
-                q_session.results.to_csv(os.path.join(RAW_DATA_PATH, qualifying_file_name), index=False)
-                print(f"   - Saved qualifying results to [green]{RAW_DATA_PATH}/{qualifying_file_name}[/green]\n")
+                print(f"   - Qualifying results already downloaded, skipping\n")
 
-            if is_sprint:
+            if needs_sprint:
                 s_session = download_session(year, round, 'S')
 
                 if s_session is None or s_session.results is None or s_session.results.empty:
                     print(f"   - [yellow]WARNING[/yellow]: Although this was a sprint event, no sprint results data returned for [red]Round {round} - {loc}[/red], skipping...\n")
-                    continue
-
-                sprint_file_name = f'{year}_Round_{round}_{loc}_sprint_results.csv'
-                s_session.results.to_csv(os.path.join(RAW_DATA_PATH, sprint_file_name), index=False)
-                print(f"   - Saved sprint results to [green]{RAW_DATA_PATH}/{sprint_file_name}[/green]\n")
+                else:
+                    s_session.results.to_csv(os.path.join(RAW_DATA_PATH, sprint_file_name), index=False)
+                    print(f"   - Saved sprint results to [green]{RAW_DATA_PATH}/{sprint_file_name}[/green]\n")
+            elif is_sprint:
+                print(f"   - Sprint results already downloaded, skipping\n")
 
     print(f"Data download completed in {time.time() - download_start_time:.2f} seconds")
 
@@ -215,6 +263,19 @@ def normalize_teamids(df: pd.DataFrame):
     df["TeamId"] = df["TeamId"].replace(["force_india", "racing_point"], ["aston_martin", "aston_martin"])
     df["TeamName"] = df["TeamName"].replace("Alfa Romeo Racing", "Alfa Romeo")
     df["TeamName"] = df["TeamName"].replace("Sauber", "Kick Sauber")
+    return df
+
+def normalize_locations(df: pd.DataFrame):
+    """fastf1's Location field is inconsistent for a handful of circuits across 2018-2026 - same
+    physical track, different string. Canonical value is each event's most recent complete season
+    (2025). Deliberately NOT touching Barcelona/Madrid (Spanish GP) or Sakhir/Kuala Lumpur
+    (Bahrain GP) - both are genuine 2026 relocations (the Bahrain GP is run at Malaysia's Kuala
+    Lumpur circuit for 2026 while keeping the "Bahrain Grand Prix" branding/title), not naming
+    inconsistencies, so those pairs must stay distinct rather than being merged together."""
+    df["Location"] = df["Location"].replace("Monte Carlo", "Monaco")
+    df["Location"] = df["Location"].replace("Yas Marina", "Yas Island")
+    df["Location"] = df["Location"].replace("Singapore", "Marina Bay")
+    df["Location"] = df["Location"].replace("Miami", "Miami Gardens")
     return df
 
 def build_round_summary_by_driver(all_seasons_data_df: pd.DataFrame):
@@ -399,6 +460,7 @@ def feature_engineer_all_data(years, incomplete_years=None, min_rounds=3):
 
     all_seasons_data_df = all_seasons_data_df.sort_values(by=["Year", "Round", "Points"], ascending=[True, True, False]).reset_index(drop=True)
     all_seasons_data_df = normalize_teamids(all_seasons_data_df)
+    all_seasons_data_df = normalize_locations(all_seasons_data_df)
     all_seasons_data_df["isDNF"] = all_seasons_data_df["ClassifiedPosition"].apply(lambda x: 1 if not str(x).isnumeric() else 0)
     all_seasons_data_df["isPointsFinish"] = all_seasons_data_df["Points"].apply(lambda x: 1 if x > 0 else 0)
     all_seasons_data_df["isPodiumFinish"] = all_seasons_data_df["Points"].apply(lambda x: 1 if x >= 15 else 0)
@@ -409,6 +471,7 @@ def feature_engineer_all_data(years, incomplete_years=None, min_rounds=3):
     if not all_seasons_qualifying_df.empty:
         all_seasons_qualifying_df = all_seasons_qualifying_df.sort_values(by=["Year", "Round", "Position"]).reset_index(drop=True)
         all_seasons_qualifying_df = normalize_teamids(all_seasons_qualifying_df)
+        all_seasons_qualifying_df = normalize_locations(all_seasons_qualifying_df)
 
     final_standings_df = all_seasons_data_df.groupby(["Year", "DriverId"], as_index=False).agg(
         FullName=("FullName", "first"),
