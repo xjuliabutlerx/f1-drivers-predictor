@@ -216,3 +216,21 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---- Project-specific ----
+
+# Ignore the data directory, but keep the pipeline code under src/data/
+data/
+!src/data/
+
+# Ignore the archive directory
+archive/
+
+# Ignore personal-use directories
+notes/
+test/
+models_in_progress/
+training_data/
+
+# Don't push any checkpoints
+*.pth
