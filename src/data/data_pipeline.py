@@ -279,6 +279,7 @@ def calculate_driver_standings_context(training_data_df: pd.DataFrame):
     return training_data_df
 
 FINAL_COLUMNS = ["Year", "DriverId", "TeamId", "Location", "Round", "RoundsCompleted", "RoundsRemaining", \
+                 "CareerSeasonsRaced", "CareerRoundsRaced", "TeamSeasonsWithCurrentTeam", "TeamRoundsWithCurrentTeam", \
                  "PointsEarnedThisRound", "DNFsThisRound", "TeammateId", "TeammatePointsGap", "BeatTeammateThisRound", \
                  "BeatTeammateRate", "PositionsGainedThisRound", "AvgPositionsGained", "PointsLast3Rounds", \
                  "DNFsLast3Rounds", "DNFRate", "AvgGridPosition", "AvgPosition", "AvgPointsPerRace", \
@@ -290,6 +291,10 @@ FINAL_COLUMNS = ["Year", "DriverId", "TeamId", "Location", "Round", "RoundsCompl
 
 def feature_engineer_all_data(years, incomplete_years=None, min_rounds=3):
     print("\nStarting data cleaning and feature engineering...")
+
+    # Career experience is a running total, so years must be processed oldest-first regardless of
+    # the order --years was passed in.
+    years = sorted(years)
 
     all_seasons_data_df = pd.DataFrame()
     preprocessed_files = os.listdir(PREPROCESSED_DATA_PATH)
@@ -316,6 +321,18 @@ def feature_engineer_all_data(years, incomplete_years=None, min_rounds=3):
 
     training_data_df = pd.DataFrame()
     incomplete_training_data_df = pd.DataFrame()
+
+    # Cumulative prior-season experience per driver, carried across years (and any career-break
+    # gap years where a driver has no rows at all) and independent of which team they're on.
+    # Note this is only "experience within the downloaded years" - a veteran whose career started
+    # before the earliest --years value will look artificially inexperienced in their first rows.
+    career_state = {}
+
+    # Tenure with the *current* team specifically (car familiarity/team fit), as opposed to
+    # overall career experience above. Resets to a fresh 0/0 stint on any team change, including
+    # a mid-season swap - even a return to a team driven for previously starts over rather than
+    # resuming the old count, since the tenure/familiarity story restarts each time a seat changes.
+    team_tenure_state = {}
 
     for year in years:
         print(f" > Processing data for the {year} season")
@@ -346,6 +363,34 @@ def feature_engineer_all_data(years, incomplete_years=None, min_rounds=3):
             # Calendar-based (not "rounds completed"-based) so it stays correct even when a driver
             # has gaps in their round sequence from a mid-season swap or substitute appearance.
             driver_rounds_df["RoundsRemaining"] = total_rounds_in_year - driver_rounds_df["Round"]
+
+            prior_career = career_state.get(driver_id, {"seasons_raced": 0, "rounds_raced": 0})
+            driver_rounds_df["CareerSeasonsRaced"] = prior_career["seasons_raced"]
+            driver_rounds_df["CareerRoundsRaced"] = prior_career["rounds_raced"] + driver_rounds_df["RoundsCompleted"]
+
+            tenure = team_tenure_state.get(driver_id, {"team_id": None, "seasons_with_team": 0, "rounds_with_team": 0, "last_year_processed": None})
+            first_team_this_year = driver_rounds_df["TeamId"].iloc[0]
+            if tenure["last_year_processed"] == year - 1 and first_team_this_year == tenure["team_id"]:
+                # Same team carried straight over from an immediately preceding season - credit
+                # that completed season before walking this year's rounds.
+                tenure["seasons_with_team"] += 1
+            elif first_team_this_year != tenure["team_id"]:
+                # New team (or this driver's very first row) - fresh stint.
+                tenure = {"team_id": first_team_this_year, "seasons_with_team": 0, "rounds_with_team": 0, "last_year_processed": None}
+
+            team_rounds_col, team_seasons_col = [], []
+            for team_id_this_round in driver_rounds_df["TeamId"]:
+                if team_id_this_round != tenure["team_id"]:
+                    # Mid-season swap - resets the stint even if it's a return to a past team.
+                    tenure["team_id"] = team_id_this_round
+                    tenure["seasons_with_team"] = 0
+                    tenure["rounds_with_team"] = 0
+                team_rounds_col.append(tenure["rounds_with_team"])
+                team_seasons_col.append(tenure["seasons_with_team"])
+                tenure["rounds_with_team"] += 1
+            driver_rounds_df["TeamRoundsWithCurrentTeam"] = team_rounds_col
+            driver_rounds_df["TeamSeasonsWithCurrentTeam"] = team_seasons_col
+            tenure["last_year_processed"] = year
 
             driver_rounds_df["AvgGridPosition"] = driver_rounds_df["GridPosition"].expanding().mean()
             driver_rounds_df["AvgPosition"] = driver_rounds_df["Position"].expanding().mean()
@@ -384,6 +429,14 @@ def feature_engineer_all_data(years, incomplete_years=None, min_rounds=3):
                 incomplete_training_data_df = pd.concat([incomplete_training_data_df, driver_rounds_df], ignore_index=True)
             elif len(driver_rounds_df) >= min_rounds:
                 training_data_df = pd.concat([training_data_df, driver_rounds_df], ignore_index=True)
+
+            # Counts toward next year's experience regardless of the min_rounds filter above -
+            # even a short substitute stint is real career history for the following season.
+            career_state[driver_id] = {
+                "seasons_raced": prior_career["seasons_raced"] + 1,
+                "rounds_raced": prior_career["rounds_raced"] + len(driver_rounds_df),
+            }
+            team_tenure_state[driver_id] = tenure
 
     if not training_data_df.empty:
         training_data_df = training_data_df.merge(team_context_df, on=["Year", "TeamId", "Round"], how="left")
