@@ -70,11 +70,14 @@ class F1DriversDataset(Dataset):
             return 0
         return int(self.df.loc[self.df["Year"] == year, "Round"].max())
 
-    def get_random_split(self, test_size=0.2, random_state=24):
-        # Randomly split the data into training and testing datasets using the pandas random sample method
-        test_df = self.df.sample(frac=test_size, random_state=random_state)
-        train_df = self.df.drop(test_df.index).sample(frac=1.0)                 # frac specifies the fraction of rows to return
-                                                                                # frac = 1 means return all rows in a random order
+    def get_season_holdout_split(self, test_years: list):
+        """Splits by whole season(s) rather than by row or by driver - every driver in a held-out
+        year goes entirely to test, and the model never trains on any row from that year at all.
+        This is what makes it valid to evaluate by ranking a held-out year's FULL field: the model
+        genuinely never saw that season, so there's no leakage the way there would be if only some
+        of a driver's rounds (or only some drivers) were excluded."""
+        test_df = self.df[self.df["Year"].isin(test_years)]
+        train_df = self.df[~self.df["Year"].isin(test_years)].sample(frac=1.0)   # frac=1 means return all rows in a random order
 
         # Split the features from the metadata and target variable columns for the training dataset to maintain "row alignment"
         X_train = train_df[self.feature_columns]

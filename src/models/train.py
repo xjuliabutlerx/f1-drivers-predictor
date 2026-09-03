@@ -77,16 +77,74 @@ def rank_misalignment_heatmap(final_test_df: pd.DataFrame, all_y_true, all_y_pre
     plt.savefig(os.path.join("heatmaps", f"model_heatmap_{datetime.now().strftime('%Y-%m-%d_%H:%M')}.png"))
     plt.close()
 
+def evaluate_model(model: F1DriversRankClassifier, full_df: pd.DataFrame, test_df: pd.DataFrame, feature_cols: list, device):
+    """Scores `model` (assumed already in eval mode) against test_df's last-row-per-driver-year
+    final standings. Factored out so both per-epoch monitoring and the final post-training report
+    (which must run AFTER the best checkpoint is reloaded, not on whatever epoch training happened
+    to stop on) score the same way.
+
+    Ranks are computed against every driver's final row for that year - pulled from full_df, not
+    just test_df - then filtered down to the held-out test drivers. Since the train/test split is
+    now grouped by (Year, DriverId), only a fraction of each year's field ends up in test_df; ranking
+    PredictedFinalRank within that fraction alone would produce values like 1..5 for a 5-driver test
+    group, which isn't comparable to a true FinalRank drawn from the full ~20-24 driver field. Running
+    inference on train-split rows here doesn't leak anything - no labels are used, they're only
+    providing the other competitors needed to place test drivers on the correct field-wide scale."""
+    with torch.no_grad():
+        idx_final_rank = full_df.sort_values(["Year", "DriverId", "RoundsCompleted"]).groupby(["Year", "DriverId"])["RoundsCompleted"].idxmax()
+
+        final_full_df = full_df.loc[idx_final_rank].copy()
+
+        X_full = torch.tensor(final_full_df[feature_cols].values, dtype=torch.float32, device=device)
+        final_full_df["PredictedFinalRank"] = model(X_full).detach().cpu().numpy()
+        final_full_df["PredictedFinalRank"] = final_full_df.groupby("Year")["PredictedFinalRank"].rank(method="first", ascending=False).astype(int)
+
+        test_keys = pd.MultiIndex.from_frame(test_df[["Year", "DriverId"]].drop_duplicates())
+        final_test_df = final_full_df[final_full_df.set_index(["Year", "DriverId"]).index.isin(test_keys)].copy()
+        final_test_df.sort_values(["Year", "DriverId"])
+
+        all_y_true = []
+        all_y_pred = []
+        spearman_scores_by_year = {}
+        kendall_scores_by_year = {}
+        predicted_rankings_by_year = {}
+
+        for year, group in final_test_df.groupby("Year"):
+            true_rank = group["FinalRank"].to_numpy()
+            pred_rank = group["PredictedFinalRank"].to_numpy()
+
+            pred_drivers = group.sort_values("PredictedFinalRank", ascending=True)["DriverId"].to_list()
+            true_drivers = group.sort_values("FinalRank", ascending=True)["DriverId"].to_list()
+            predicted_rankings_by_year[year] = {"Predicted": pred_drivers, "Actual": true_drivers}
+
+            all_y_true.extend(true_rank)
+            all_y_pred.extend(pred_rank)
+
+            rho, _ = spearmanr(true_rank, pred_rank)
+            tau, _ = kendalltau(true_rank, pred_rank)
+
+            spearman_scores_by_year[year] = float(rho) if not np.isnan(rho) else None
+            kendall_scores_by_year[year] = float(tau) if not np.isnan(tau) else None
+
+        valid_rhos = [r for r in spearman_scores_by_year.values() if r is not None]
+        valid_taus = [t for t in kendall_scores_by_year.values() if t is not None]
+
+        avg_rho = float(np.mean(valid_rhos)) if valid_rhos else float("nan")
+        avg_tau = float(np.mean(valid_taus)) if valid_taus else float("nan")
+
+    return final_test_df, all_y_true, all_y_pred, avg_rho, avg_tau, spearman_scores_by_year, kendall_scores_by_year, predicted_rankings_by_year
+
 if __name__ == "__main__":
     PARSER = argparse.ArgumentParser()
     PARSER.add_argument("--num_epochs", "-e", type=int, default=50)
     PARSER.add_argument("--learning_rate", "-lr", type=float, default=0.001)
     PARSER.add_argument("--decay_rate", "-d", type=float, default=0.95)
     PARSER.add_argument("--decay_every", "-f", type=int, default=5)
-    PARSER.add_argument("--test_size", "-s", type=float, default=0.2)
+    PARSER.add_argument("--test_years", "-s", nargs="+", type=int, default=[2024, 2025],
+                         help="Whole season(s) to hold out entirely as test - the model never trains on these years, "
+                              "so evaluation can rank each held-out year's FULL field rather than a fragment of it.")
     PARSER.add_argument("--margin", "-m", type=float, default=1.0)
     PARSER.add_argument("--patience", "-p", type=int, default=15)
-    PARSER.add_argument("--random_state", "-r", type=int, default=24)
     PARSER.add_argument("--alpha", "-a", type=float, default=2.0)
     PARSER.add_argument("--round_window", "-w", type=int, default=0)
     PARSER.add_argument("--checkpoint", "-c", type=str, default=None)
@@ -95,46 +153,41 @@ if __name__ == "__main__":
 
     print()
 
-    test_size = ARGS.test_size
+    test_years = ARGS.test_years
     num_epochs = ARGS.num_epochs
     learning_rate = ARGS.learning_rate
     decay = ARGS.decay_rate
     decay_every = ARGS.decay_every
     margin = ARGS.margin
     patience = ARGS.patience
-    random_state = ARGS.random_state
     alpha = ARGS.alpha
     round_window = ARGS.round_window
     checkpoint_path = ARGS.checkpoint
 
-    current_datetime = datetime.now().strftime("%Y-%m-%d_%H:%M")
-
-    if test_size > 1:
-        print(f"[red]ERROR[/red]: Test size cannot be more than 1; received {test_size}")
-        exit(0)
-    elif test_size <= 0:
-        print(f"[red]ERROR[/red]: Test size cannot be less than or equal to 0; received {test_size}")
-        exit(0)
+    # Seconds precision, not just minutes - two runs started in the same minute (e.g. one in the
+    # background while another runs in the foreground) would otherwise compute the identical
+    # current_datetime and silently overwrite each other's pretrained_models/*.pt and
+    # training_data/*.xlsx files (checkpoints/*.pth are safe regardless, since their filenames also
+    # include epoch+rho).
+    current_datetime = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
 
     model_param_data = {
         "Test Timestamp": [current_datetime],
         "Number of Epochs": [num_epochs],
-        "Training Size": [(1 - test_size) * 100],
+        "Test Years (held out entirely)": [test_years],
         "Round Window": [round_window],
-        "Test Size": [test_size * 100],
         "Decay Rate": [decay],
         "Decay Every n Epochs": [decay_every],
         "Margin": [margin],
         "Alpha": [alpha],
         "Patience": [patience],
-        "Random State": [random_state]
     }
 
     print("[yellow]*** TRAINING F1 DRIVERS RANK CLASSIFIER MODEL v1 ***[/yellow]")
     print()
 
     print("Training Parameters:")
-    print(f" > Test Size: {test_size * 100}%")
+    print(f" > Test Years (held out entirely, ranked as full fields): {test_years}")
     if round_window == 0:
         print(f"   - Will only compare pairs of samples from within the same round")
     else:
@@ -150,7 +203,6 @@ if __name__ == "__main__":
     print(f"     tightness lives at a fixed rank band the way the constructors model does")
     print(f" > Loss Function Margin: {margin}")
     print(f" > Patience: {patience}")
-    print(f" > Random State: {random_state}")
     print(f" > Load from Checkpoint: {True if checkpoint_path is not None else False}")
     print()
 
@@ -169,7 +221,7 @@ if __name__ == "__main__":
     print(f"[green]done[/green]")
 
     print(f" > Splitting dataset into training and testing...", end="")
-    X_train, y_train, test_df = dataset.get_random_split(test_size=test_size, random_state=random_state)
+    X_train, y_train, test_df = dataset.get_season_holdout_split(test_years=test_years)
     print(f"[green]done[/green]")
 
     print(f" > Converting the training dataset into tensors...", end="")
@@ -272,48 +324,8 @@ if __name__ == "__main__":
         optimizer.step()
 
         model.eval()
-        with torch.no_grad():
-            idx_final_rank = test_df.sort_values(["Year", "DriverId", "RoundsCompleted"]).groupby(["Year", "DriverId"])["RoundsCompleted"].idxmax()
-
-            final_test_df = test_df.loc[idx_final_rank].copy()
-            final_test_df.sort_values(["Year", "DriverId"])
-
-            X_test = torch.tensor(final_test_df[feature_cols].values, dtype=torch.float32, device=device)
-            final_test_df["PredictedFinalRank"] = model(X_test).detach().cpu().numpy()
-            final_test_df["PredictedFinalRank"] = final_test_df.groupby("Year")["PredictedFinalRank"].rank(method="first", ascending=False).astype(int)
-
-            all_y_true = []
-            all_y_pred = []
-            spearman_scores_by_year = {}
-            kendall_scores_by_year = {}
-            predicted_rankings_by_year = {}
-
-            for year, group in final_test_df.groupby("Year"):
-                true_rank = group["FinalRank"].to_numpy()
-                pred_rank = group["PredictedFinalRank"].to_numpy()
-
-                pred_drivers = group.sort_values("PredictedFinalRank", ascending=True)["DriverId"].to_list()
-                true_drivers = group.sort_values("FinalRank", ascending=True)["DriverId"].to_list()
-                results = {
-                    "Predicted": pred_drivers,
-                    "Actual": true_drivers
-                }
-                predicted_rankings_by_year[year] = results
-
-                all_y_true.extend(true_rank)
-                all_y_pred.extend(pred_rank)
-
-                rho, _ = spearmanr(true_rank, pred_rank)
-                tau, _ = kendalltau(true_rank, pred_rank)
-
-                spearman_scores_by_year[year] = float(rho) if not np.isnan(rho) else None
-                kendall_scores_by_year[year] = float(tau) if not np.isnan(tau) else None
-
-            valid_rhos = [r for r in spearman_scores_by_year.values() if r is not None]
-            valid_taus = [t for t in kendall_scores_by_year.values() if t is not None]
-
-            avg_rho = float(np.mean(valid_rhos)) if valid_rhos else float("nan")
-            avg_tau = float(np.mean(valid_taus)) if valid_taus else float("nan")
+        final_test_df, all_y_true, all_y_pred, avg_rho, avg_tau, spearman_scores_by_year, kendall_scores_by_year, predicted_rankings_by_year = \
+            evaluate_model(model, dataset.df, test_df, feature_cols, device)
 
         improved = avg_rho > best_rho + 1e-4
         if improved:
@@ -339,6 +351,18 @@ if __name__ == "__main__":
 
     print()
 
+    if best_checkpoint_path != "" and os.path.exists(os.path.join("checkpoints", best_checkpoint_path)):
+        print("Loading best checkpoint...", end="")
+        best_checkpoint = torch.load(os.path.join("checkpoints", best_checkpoint_path), map_location=device)
+        model.load_state_dict(best_checkpoint["model_state_dict"])
+        model.eval()
+        print("[green]done[/green]")
+
+        # Final report must reflect the BEST checkpoint, not whichever epoch training happened to
+        # stop on - early stopping's patience window means the last epoch run can be meaningfully
+        # worse than the best one that was actually saved.
+        final_test_df, all_y_true, all_y_pred, best_rho, _, _, _, _ = evaluate_model(model, dataset.df, test_df, feature_cols, device)
+
     print("Evaluating model...")
     mean_abs_error = mean_absolute_error(all_y_true, all_y_pred)
     med_abs_error = median_absolute_error(all_y_true, all_y_pred)
@@ -349,12 +373,6 @@ if __name__ == "__main__":
     print(f" > Maximum Error: {maximum_error:.4f}")
     rank_misalignment_heatmap(final_test_df, all_y_true, all_y_pred, mean_abs_error, med_abs_error, maximum_error, best_rho)
     print()
-
-    if best_checkpoint_path != "" and os.path.exists(os.path.join("checkpoints", best_checkpoint_path)):
-        print("Loading best checkpoint...", end="")
-        best_checkpoint = torch.load(os.path.join("checkpoints", best_checkpoint_path), map_location=device)
-        model.load_state_dict(best_checkpoint["model_state_dict"])
-        print("[green]done[/green]")
 
     print("Saving model and training results...", end="")
     model_file_path = os.path.join("pretrained_models", f"f1_drivers_ranking_model_{current_datetime}.pt")
