@@ -31,10 +31,20 @@ python data_pipeline.py --step all    # download -> preprocess -> features
 
 **Model training** (`src/models/`):
 ```bash
-python setup.py       # bootstraps checkpoints/, heatmaps/, pretrained_models/, training_data/ (idempotent)
-python train.py -e 300   # -e/--num_epochs; see train.py's argparse block for the rest (-lr, -a alpha, -w round_window, -p patience, etc.)
+python setup.py       # bootstraps v1/v2/v3 {checkpoints,heatmaps,pretrained_models,training_data} + shap_analysis/v{1,2,3} (idempotent)
+cd v1 && python train.py -e 300   # -e/--num_epochs; see train.py's argparse block for the rest (-lr, -a alpha, -w round_window, -p patience, etc.)
 ```
-No `predict.py` / `predict_ensemble.py` yet, and no versioned `v1/`/`v2/`/`v3` model directories (unlike the sibling project) — this repo has a single `src/models/` tree; a version gets forked into its own directory only once there's an actual divergent iteration worth preserving, not preemptively.
+Model code is versioned into `v1`/`v2`/`v3` directories, mirroring the sibling project: each holds its own `f1_dataset.py`, `f1_drivers_rank_classifier.py`, `train.py`, `checkpoints/`, `heatmaps/`, `pretrained_models/`, `training_data/`, and is run from inside that directory (`train.py`'s relative `../../../data/...` path assumes this). `v1` is the validated baseline (season-holdout evaluation, tuned hyperparameters, SHAP-reviewed feature set); a new version gets forked only once there's an actual divergent iteration worth preserving (e.g. dropping SHAP-flagged low-value features), not preemptively.
+
+`predict.py`, `mid_season_evaluation.py`, and `model_shap_analysis.py` stay at the top level of `src/models/` (not versioned) and take a `--version`/`-v` flag (default `1`) to import the right `vN.f1_dataset`/`vN.f1_drivers_rank_classifier` at runtime — same pattern as the sibling project. `model_shap_analysis.py`'s `--analysis_path` isn't auto-versioned, so pass it explicitly (e.g. `-a shap_analysis/v1`) to match. Each of the three duplicates a small local `get_device()` rather than importing it from `train.py`, since `train.py` now lives inside a version-specific directory.
+
+v1's 3 models are named after F1 drivers rather than generic identifiers (see the dashboard's Model Naming Scheme page): `prost_model.pt` (held out on 2020-2021, rho 0.9908 — sharpest/lowest-error), `schumacher_model.pt` (2022-2023, rho 0.9881 — steadiest, no big swings), `senna_model.pt` (2024-2025, rho 0.9529 — most volatile but still solid). Heatmap and SHAP output filenames are kept in sync with these names.
+
+**Dashboard** (`src/dashboard/`), a Streamlit app — unlike `src/data/`/`src/models/`, it's run from the **repo root**, matching the sibling project:
+```bash
+streamlit run src/dashboard/Main.py
+```
+It's a skeleton mirroring the sibling project's page structure (`Main.py` + `pages/{1_Model_Development_&_Training,2_Model_Data_Features,3_Model_Naming_Scheme,4_Current_Model_Predictions}.py`), with its own self-contained copies of `f1_dataset.py`/`f1_drivers_rank_classifier.py` under `pages/utils/` (not imported from `src/models/`, so the dashboard doesn't depend on which model version is currently checked out). `4_Current_Model_Predictions.py` runs all 3 v1 models live against `data/clean/f1_drivers_clean_prediction_data.csv` on every page load via `pages/utils/predict.py`, rather than reading a pre-baked predictions CSV like the sibling project does. There's no `5_Scenario_Simulator.py` yet — the sibling's version is tightly coupled to its own constructor-level feature synthesis, and porting it needs its own design pass for driver-level features (teammate gaps, qualifying data, career/team tenure running state) rather than a direct copy.
 
 There is no test suite, linter, or build step configured in this repo yet.
 
