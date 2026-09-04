@@ -1,7 +1,4 @@
-from f1_dataset import F1DriversDataset
-from f1_drivers_rank_classifier import F1DriversRankClassifier
 from rich import print
-from train import get_device
 
 import argparse
 import matplotlib.pyplot as plt
@@ -10,6 +7,17 @@ import os
 import pandas as pd
 import shap
 import torch
+
+def get_device():
+    if torch.backends.mps.is_available():
+        print(f"GPU detected - Apple [magenta]Metal Performance Shaders[/magenta]")
+        return torch.device("mps")
+    elif torch.cuda.is_available():
+        print(f"GPU detected - NVIDIA [magenta]Compute Unified Device Architecture[/magenta]")
+        return torch.device("cuda", 0)
+    else:
+        print("No GPU detected - defaulting to CPU")
+        return torch.device("cpu")
 
 def callable_model(model, x: np.ndarray):
     X_values = torch.tensor(x, dtype=torch.float32).to(device)
@@ -53,6 +61,7 @@ if __name__ == "__main__":
     PARSER.add_argument("--training_data_path", "-d", type=str, required=False, default=None)
     PARSER.add_argument("--sample_size", "-s", type=int, default=50)
     PARSER.add_argument("--analysis_path", "-a", type=str, default="shap_analysis", help="Directory to save SHAP analysis results")
+    PARSER.add_argument("--version", "-v", type=int, required=False, default=1)
 
     ARGS = PARSER.parse_args()
 
@@ -64,6 +73,7 @@ if __name__ == "__main__":
     training_data_path = ARGS.training_data_path if ARGS.training_data_path is not None else os.path.join("../../data/clean/", "f1_drivers_clean_data.csv")
     sample_size = ARGS.sample_size
     analysis_path = ARGS.analysis_path
+    version = ARGS.version
 
     if models_dir_path is None or not os.path.isdir(models_dir_path):
         print(f"[red]ERROR[/red]: You must provide a valid directory path for the pretrained models.\n")
@@ -83,6 +93,10 @@ if __name__ == "__main__":
         print(f"[red]ERROR[/red]: You must provide a valid path for the training data.\n")
         exit(0)
 
+    if version not in [1, 2, 3]:
+        print(f"[red]ERROR[/red]: Invalid model version {version}.\n")
+        exit(0)
+
     print(f"Parameters:")
     print(f" > Models Directory Path: {models_dir_path}")
     for model_file in model_files_list:
@@ -94,6 +108,31 @@ if __name__ == "__main__":
     print()
 
     print("Data:")
+    if version == 1:
+        print(f" > Loading v1 F1 Drivers Dataset...", end="")
+        from v1.f1_dataset import F1DriversDataset
+        print("[green]done[/green]")
+
+        print(f" > Loading v1 F1 Drivers Rank Classifier model...", end="")
+        from v1.f1_drivers_rank_classifier import F1DriversRankClassifier
+        print("[green]done[/green]")
+    elif version == 2:
+        print(f" > Loading v2 F1 Drivers Dataset...", end="")
+        from v2.f1_dataset import F1DriversDataset
+        print("[green]done[/green]")
+
+        print(f" > Loading v2 F1 Drivers Rank Classifier model...", end="")
+        from v2.f1_drivers_rank_classifier import F1DriversRankClassifier
+        print("[green]done[/green]")
+    elif version == 3:
+        print(f" > Loading v3 F1 Drivers Dataset...", end="")
+        from v3.f1_dataset import F1DriversDataset
+        print("[green]done[/green]")
+
+        print(f" > Loading v3 F1 Drivers Rank Classifier model...", end="")
+        from v3.f1_drivers_rank_classifier import F1DriversRankClassifier
+        print("[green]done[/green]")
+
     print(f" > Loading dataset...", end="")
     dataset = F1DriversDataset(training_data_path)
     print(f"[green]done[/green]")

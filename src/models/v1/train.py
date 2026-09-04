@@ -6,7 +6,6 @@ from scipy.stats import spearmanr, kendalltau
 from sklearn.metrics import mean_absolute_error, median_absolute_error, max_error
 
 import argparse
-import itertools
 import json
 import matplotlib.pyplot as plt
 import numpy as np
@@ -57,7 +56,7 @@ def adjust_learning_rate(learning_rate, optimizer: optim.Adam, epoch, decay_rate
 
     return lr
 
-def rank_misalignment_heatmap(final_test_df: pd.DataFrame, all_y_true, all_y_pred, mean_abs_error, med_abs_error, max_error, best_rho):
+def rank_misalignment_heatmap(current_datetime: str, final_test_df: pd.DataFrame, all_y_true, all_y_pred, mean_abs_error, med_abs_error, max_error, best_rho):
     # Sized from the actual observed rank values, not the test split's per-year driver count -
     # with a 20-24 driver field a random 20% sample doesn't always include every driver for a
     # given year, so a true/predicted rank can exceed that year's sampled driver count.
@@ -74,7 +73,11 @@ def rank_misalignment_heatmap(final_test_df: pd.DataFrame, all_y_true, all_y_pre
     plt.xlabel("Predicted Rank")
     plt.ylabel("True Rank")
     plt.title(f"F1 Drivers Rank Misalignment Heatmap\nBest Rho={best_rho:.4f}, Mean Absolute Error={mean_abs_error:.2f}, Median={med_abs_error:.2f}, Max={max_error}")
-    plt.savefig(os.path.join("heatmaps", f"model_heatmap_{datetime.now().strftime('%Y-%m-%d_%H:%M')}.png"))
+    # Shares the run's current_datetime (not a fresh datetime.now() call here) so a heatmap's
+    # filename always matches its model/checkpoint/training-data filenames - otherwise the two
+    # timestamps drift apart by however long training took, making it hard to tell which files
+    # belong to the same run.
+    plt.savefig(os.path.join("heatmaps", f"model_heatmap_{current_datetime}.png"))
     plt.close()
 
 def evaluate_model(model: F1DriversRankClassifier, full_df: pd.DataFrame, test_df: pd.DataFrame, feature_cols: list, device):
@@ -137,15 +140,15 @@ def evaluate_model(model: F1DriversRankClassifier, full_df: pd.DataFrame, test_d
 if __name__ == "__main__":
     PARSER = argparse.ArgumentParser()
     PARSER.add_argument("--num_epochs", "-e", type=int, default=50)
-    PARSER.add_argument("--learning_rate", "-lr", type=float, default=0.001)
+    PARSER.add_argument("--learning_rate", "-lr", type=float, default=0.005)
     PARSER.add_argument("--decay_rate", "-d", type=float, default=0.95)
     PARSER.add_argument("--decay_every", "-f", type=int, default=5)
     PARSER.add_argument("--test_years", "-s", nargs="+", type=int, default=[2024, 2025],
                          help="Whole season(s) to hold out entirely as test - the model never trains on these years, "
                               "so evaluation can rank each held-out year's FULL field rather than a fragment of it.")
-    PARSER.add_argument("--margin", "-m", type=float, default=1.0)
+    PARSER.add_argument("--margin", "-m", type=float, default=2.0)
     PARSER.add_argument("--patience", "-p", type=int, default=15)
-    PARSER.add_argument("--alpha", "-a", type=float, default=2.0)
+    PARSER.add_argument("--alpha", "-a", type=float, default=4.0)
     PARSER.add_argument("--round_window", "-w", type=int, default=0)
     PARSER.add_argument("--checkpoint", "-c", type=str, default=None)
 
@@ -208,7 +211,7 @@ if __name__ == "__main__":
 
     print("Data:")
     print(f" > Loading dataset...", end="")
-    dataset = F1DriversDataset(os.path.join("../../data/clean/", "f1_drivers_clean_data.csv"))
+    dataset = F1DriversDataset(os.path.join("../../../data/clean/", "f1_drivers_clean_data.csv"))
     print(f"[green]done[/green]")
 
     print(f" > Retrieving feature column names...", end="")
@@ -263,6 +266,61 @@ if __name__ == "__main__":
             print(f"[red]failed[/red] (moving forward with new model and weights)")
 
     print()
+    print(f" > Building same-round(+/-{round_window}) training pairs (fixed for the whole run - doesn't depend on model weights, so this only needs to happen once, not every epoch)...", end="")
+    # Every pair's row indices, points-gap weight, and true/false ordering are fully determined by
+    # the (fixed) train split and hyperparameters (round_window, alpha) alone - none of it depends
+    # on the model's current weights or the epoch number. Building it once here, instead of
+    # rebuilding it from scratch every epoch (as before), turns an O(num_epochs) cost into O(1).
+    # TotalPoints is log1p-transformed in the feature tensor - expm1 recovers the actual point
+    # totals so the gap is measured in real points, not log-points.
+    raw_points_np = np.expm1(X_train[:, total_points_col_idx].detach().cpu().numpy())
+    y_train_np = y_train.detach().cpu().numpy()
+
+    i_idx_parts, j_idx_parts, pair_weight_parts, pair_target_parts = [], [], [], []
+
+    for year in np.unique(years_train):
+        year_mask = (years_train == year)
+        year_rounds = dataset.get_total_rounds_for_year(year)
+
+        for round_num in range(1, year_rounds + 1):
+            # Matches each row's OWN Round value against round_num (+/- round_window), rather
+            # than the whole year's round *count* - so round_window=0 genuinely means
+            # "same round only", not "only the last round of the season".
+            round_mask = year_mask & (np.abs(rounds_train - round_num) <= round_window)
+            idx = np.where(round_mask)[0]
+            n = len(idx)
+
+            if n < 2:
+                continue
+
+            # Every ordered pair within this (year, round) group - no cap, no oversampling by
+            # rank band. The points-gap weight below does the emphasis instead. Vectorized
+            # equivalent of itertools.permutations(idx, 2): repeat/tile every combination, then
+            # drop the n self-pairs (i_idx == j_idx) - much faster to build than a Python-level
+            # loop once these groups get large (e.g. round_window > 0).
+            i_idx = np.repeat(idx, n)
+            j_idx = np.tile(idx, n)
+            keep = i_idx != j_idx
+            i_idx, j_idx = i_idx[keep], j_idx[keep]
+
+            points_gap_per_round = np.abs(raw_points_np[i_idx] - raw_points_np[j_idx]) / round_num
+            pair_w = 1.0 + alpha / (1.0 + points_gap_per_round)
+
+            pair_targets = np.where(y_train_np[i_idx] < y_train_np[j_idx], 1.0, -1.0)
+
+            i_idx_parts.append(i_idx)
+            j_idx_parts.append(j_idx)
+            pair_weight_parts.append(pair_w)
+            pair_target_parts.append(pair_targets)
+
+    i_idx_all = torch.as_tensor(np.concatenate(i_idx_parts), dtype=torch.long, device=device)
+    j_idx_all = torch.as_tensor(np.concatenate(j_idx_parts), dtype=torch.long, device=device)
+    X_i_pairs = X_train[i_idx_all]
+    X_j_pairs = X_train[j_idx_all]
+    pairs_result = torch.tensor(np.concatenate(pair_target_parts), dtype=torch.float32).to(device)
+    pair_weights = torch.tensor(np.concatenate(pair_weight_parts), dtype=torch.float32).to(device)
+    print(f"[green]done[/green] ({X_i_pairs.shape[0]} pairs)")
+
     print("Training model...")
     training_df = pd.DataFrame(columns=["Epoch", "Learning Rate", "Training Loss", "Spearman's Rho", "Kendall's Tau"])
 
@@ -271,47 +329,6 @@ if __name__ == "__main__":
         learning_rate = adjust_learning_rate(learning_rate, optimizer, epoch, decay_rate=decay, decay_every=decay_every)
 
         scores = model(X_train).to(device)
-
-        X_i_pairs, X_j_pairs, pairs_result, pair_weights = [], [], [], []
-
-        for year in np.unique(years_train):
-            year_mask = (years_train == year)
-            year_rounds = dataset.get_total_rounds_for_year(year)
-
-            for round_num in range(1, year_rounds + 1):
-                # Matches each row's OWN Round value against round_num (+/- round_window), rather
-                # than the whole year's round *count* - so round_window=0 genuinely means
-                # "same round only", not "only the last round of the season".
-                round_mask = year_mask & (np.abs(rounds_train - round_num) <= round_window)
-                idx = np.where(round_mask)[0]
-
-                if len(idx) < 2:
-                    continue
-
-                # Every ordered pair within this (year, round) group - no cap, no oversampling by
-                # rank band. The points-gap weight below does the emphasis instead.
-                ordered_pairs = list(itertools.permutations(idx, 2))
-                i_idx = np.array([p[0] for p in ordered_pairs])
-                j_idx = np.array([p[1] for p in ordered_pairs])
-
-                X_i_pairs.extend(X_train[i_idx])
-                X_j_pairs.extend(X_train[j_idx])
-
-                # TotalPoints is log1p-transformed in the feature tensor - expm1 recovers the
-                # actual point totals so the gap is measured in real points, not log-points.
-                raw_points_i = np.expm1(X_train[i_idx, total_points_col_idx].detach().cpu().numpy())
-                raw_points_j = np.expm1(X_train[j_idx, total_points_col_idx].detach().cpu().numpy())
-                points_gap_per_round = np.abs(raw_points_i - raw_points_j) / round_num
-                pair_w = 1.0 + alpha / (1.0 + points_gap_per_round)
-                pair_weights.extend(pair_w)
-
-                pair_targets = np.where(y_train[i_idx].cpu().numpy() < y_train[j_idx].cpu().numpy(), 1.0, -1.0)
-                pairs_result.extend(pair_targets)
-
-        X_i_pairs = torch.stack(X_i_pairs).to(device)
-        X_j_pairs = torch.stack(X_j_pairs).to(device)
-        pairs_result = torch.tensor(pairs_result, dtype=torch.float32).to(device)
-        pair_weights = torch.tensor(np.array(pair_weights), dtype=torch.float32).to(device)
 
         s_i = model(X_i_pairs)
         s_j = model(X_j_pairs)
@@ -371,7 +388,7 @@ if __name__ == "__main__":
     print(f" > Mean Absolute Error: {mean_abs_error:.4f}")
     print(f" > Median Absolute Error: {med_abs_error:.4f}")
     print(f" > Maximum Error: {maximum_error:.4f}")
-    rank_misalignment_heatmap(final_test_df, all_y_true, all_y_pred, mean_abs_error, med_abs_error, maximum_error, best_rho)
+    rank_misalignment_heatmap(current_datetime, final_test_df, all_y_true, all_y_pred, mean_abs_error, med_abs_error, maximum_error, best_rho)
     print()
 
     print("Saving model and training results...", end="")
