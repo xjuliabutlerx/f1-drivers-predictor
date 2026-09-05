@@ -90,5 +90,5 @@ class F1DriversDataset(Dataset):
 
 if __name__ == "__main__":
     import os
-    dataset = F1DriversDataset(os.path.join("../../../data/clean/", "f1_drivers_clean_data.csv"))
+    dataset = F1DriversDataset(os.path.join("../../../../data/clean/", "f1_drivers_clean_data.csv"))
     print(f"Loaded {len(dataset.df)} rows with {len(dataset.feature_columns)} feature columns.")
