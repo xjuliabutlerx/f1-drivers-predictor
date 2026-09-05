@@ -1,6 +1,7 @@
 from rich import print
 
 import argparse
+import importlib
 import matplotlib.pyplot as plt
 import numpy as np
 import os
@@ -19,6 +20,28 @@ def get_device():
         print("No GPU detected - defaulting to CPU")
         return torch.device("cpu")
 
+def resolve_classifier_class(version: int, model_path: str):
+    """Prefers a model-specific f1_drivers_rank_classifier_{name}.py (e.g. schumacher_model.pt ->
+    f1_drivers_rank_classifier_schumacher.py) over the shared f1_drivers_rank_classifier.py.
+    The shared file's architecture/activation can change across experiments, and since activation
+    functions (ReLU/GELU/LeakyReLU) have no learnable parameters, load_state_dict() succeeds
+    silently even when it doesn't match what a given model was actually trained with - it just runs
+    the loaded weights through the wrong nonlinearity, silently producing wrong SHAP results.
+    Resolved once per model file (not once for the whole models_dir_path), since a single version
+    directory can hold models trained under different classifier definitions. Falls back to the
+    shared file for models that don't have a dedicated one (e.g. all of v1)."""
+    model_name = os.path.basename(model_path)
+    if model_name.endswith("_model.pt"):
+        model_name = model_name[:-len("_model.pt")]
+        try:
+            module = importlib.import_module(f"v{version}.f1_drivers_rank_classifier_{model_name}")
+            return module.F1DriversRankClassifier
+        except ModuleNotFoundError:
+            pass
+
+    module = importlib.import_module(f"v{version}.f1_drivers_rank_classifier")
+    return module.F1DriversRankClassifier
+
 def callable_model(model, x: np.ndarray):
     X_values = torch.tensor(x, dtype=torch.float32).to(device)
     with torch.no_grad():
@@ -31,11 +54,11 @@ def callable_model(model, x: np.ndarray):
         ranks[order] = np.arange(1, len(scores) + 1)
         return ranks
 
-def run_shap_analysis(model_name: str, model_path: str, dataset_df: pd.DataFrame, feature_cols: list, device: torch.device, sample_size: int = 50, analysis_dir: str = "shap_analysis"):
+def run_shap_analysis(model_name: str, model_path: str, classifier_class, dataset_df: pd.DataFrame, feature_cols: list, device: torch.device, sample_size: int = 50, analysis_dir: str = "shap_analysis"):
     X_values = torch.tensor(dataset_df[feature_cols].values, dtype=torch.float32).to(device)
     X_numpy = dataset_df[feature_cols].values.astype(np.float32)
 
-    model = F1DriversRankClassifier(X_values.shape[1], 1).to(device)
+    model = classifier_class(X_values.shape[1], 1).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
@@ -112,26 +135,14 @@ if __name__ == "__main__":
         print(f" > Loading v1 F1 Drivers Dataset...", end="")
         from v1.f1_dataset import F1DriversDataset
         print("[green]done[/green]")
-
-        print(f" > Loading v1 F1 Drivers Rank Classifier model...", end="")
-        from v1.f1_drivers_rank_classifier import F1DriversRankClassifier
-        print("[green]done[/green]")
     elif version == 2:
         print(f" > Loading v2 F1 Drivers Dataset...", end="")
         from v2.f1_dataset import F1DriversDataset
         print("[green]done[/green]")
-
-        print(f" > Loading v2 F1 Drivers Rank Classifier model...", end="")
-        from v2.f1_drivers_rank_classifier import F1DriversRankClassifier
-        print("[green]done[/green]")
-    elif version == 3:
-        print(f" > Loading v3 F1 Drivers Dataset...", end="")
-        from v3.f1_dataset import F1DriversDataset
-        print("[green]done[/green]")
-
-        print(f" > Loading v3 F1 Drivers Rank Classifier model...", end="")
-        from v3.f1_drivers_rank_classifier import F1DriversRankClassifier
-        print("[green]done[/green]")
+    # elif version == 3:
+    #     print(f" > Loading v3 F1 Drivers Dataset...", end="")
+    #     from v3.f1_dataset import F1DriversDataset
+    #     print("[green]done[/green]")
 
     print(f" > Loading dataset...", end="")
     dataset = F1DriversDataset(training_data_path)
@@ -148,8 +159,9 @@ if __name__ == "__main__":
     print("Analysis:")
     for model_file in model_files_list:
         model_name = model_file[:-3].replace("_", " ").title()
+        classifier_class = resolve_classifier_class(version, model_file)
 
         print(f" > Analyzing [magenta]{model_name}[/magenta]...", end="")
-        run_shap_analysis(model_name, os.path.join(models_dir_path, model_file), dataset.df, feature_cols, device,
+        run_shap_analysis(model_name, os.path.join(models_dir_path, model_file), classifier_class, dataset.df, feature_cols, device,
                            sample_size=sample_size, analysis_dir=analysis_path)
         print(f"[green]done[/green]")
