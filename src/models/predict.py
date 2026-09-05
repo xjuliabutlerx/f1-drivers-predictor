@@ -1,6 +1,7 @@
 from rich import print
 
 import argparse
+import importlib
 import os
 import pandas as pd
 import torch
@@ -15,6 +16,29 @@ def get_device():
     else:
         print("No GPU detected - defaulting to CPU")
         return torch.device("cpu")
+
+def resolve_classifier_class(version: int, model_path: str):
+    """Prefers a model-specific f1_drivers_rank_classifier_{name}.py (e.g. schumacher_model.pt ->
+    f1_drivers_rank_classifier_schumacher.py) over the shared f1_drivers_rank_classifier.py.
+    The shared file's architecture/activation can change across experiments, and since activation
+    functions (ReLU/GELU/LeakyReLU) have no learnable parameters, load_state_dict() succeeds
+    silently even when it doesn't match what a given model was actually trained with - it just runs
+    the loaded weights through the wrong nonlinearity, producing systematically wrong predictions
+    with no error at all. Falls back to the shared file for models that don't have a dedicated one
+    (e.g. all of v1, which has never diverged from a single shared architecture)."""
+    model_name = os.path.basename(model_path)
+    if model_name.endswith("_model.pt"):
+        model_name = model_name[:-len("_model.pt")]
+        try:
+            module = importlib.import_module(f"v{version}.f1_drivers_rank_classifier_{model_name}")
+            print(f" > Loading v{version} F1 Drivers Rank Classifier model (dedicated: {model_name})...", end="")
+            return module.F1DriversRankClassifier
+        except ModuleNotFoundError:
+            pass
+
+    module = importlib.import_module(f"v{version}.f1_drivers_rank_classifier")
+    print(f" > Loading v{version} F1 Drivers Rank Classifier model (shared)...", end="")
+    return module.F1DriversRankClassifier
 
 if __name__ == "__main__":
     PARSER = argparse.ArgumentParser()
@@ -56,26 +80,17 @@ if __name__ == "__main__":
         print(f" > Loading v1 F1 Drivers Dataset...", end="")
         from v1.f1_dataset import F1DriversDataset
         print("[green]done[/green]")
-
-        print(f" > Loading v1 F1 Drivers Rank Classifier model...", end="")
-        from v1.f1_drivers_rank_classifier import F1DriversRankClassifier
-        print("[green]done[/green]")
     elif version == 2:
         print(f" > Loading v2 F1 Drivers Dataset...", end="")
         from v2.f1_dataset import F1DriversDataset
         print("[green]done[/green]")
+    # elif version == 3:
+    #     print(f" > Loading v3 F1 Drivers Dataset...", end="")
+    #     from v3.f1_dataset import F1DriversDataset
+    #     print("[green]done[/green]")
 
-        print(f" > Loading v2 F1 Drivers Rank Classifier model...", end="")
-        from v2.f1_drivers_rank_classifier import F1DriversRankClassifier
-        print("[green]done[/green]")
-    elif version == 3:
-        print(f" > Loading v3 F1 Drivers Dataset...", end="")
-        from v3.f1_dataset import F1DriversDataset
-        print("[green]done[/green]")
-
-        print(f" > Loading v3 F1 Drivers Rank Classifier model...", end="")
-        from v3.f1_drivers_rank_classifier import F1DriversRankClassifier
-        print("[green]done[/green]")
+    F1DriversRankClassifier = resolve_classifier_class(version, model_path)
+    print("[green]done[/green]")
 
     print(f" > Loading prediction dataset...", end="")
     dataset = F1DriversDataset(pred_data_path)
