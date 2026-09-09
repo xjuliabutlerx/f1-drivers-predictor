@@ -116,7 +116,7 @@ if __name__ == "__main__":
         print(f"[red]ERROR[/red]: You must provide a valid path for the training data.\n")
         exit(0)
 
-    if version not in [1, 2, 3]:
+    if version not in [1, 2]:
         print(f"[red]ERROR[/red]: Invalid model version {version}.\n")
         exit(0)
 
@@ -139,10 +139,6 @@ if __name__ == "__main__":
         print(f" > Loading v2 F1 Drivers Dataset...", end="")
         from v2.f1_dataset import F1DriversDataset
         print("[green]done[/green]")
-    # elif version == 3:
-    #     print(f" > Loading v3 F1 Drivers Dataset...", end="")
-    #     from v3.f1_dataset import F1DriversDataset
-    #     print("[green]done[/green]")
 
     print(f" > Loading dataset...", end="")
     dataset = F1DriversDataset(training_data_path)

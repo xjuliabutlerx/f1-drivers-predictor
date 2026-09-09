@@ -52,6 +52,57 @@ with st.expander("Clark v1 Heatmap"):
 with st.expander("Button v1 Heatmap"):
     st.image(os.path.join("src", "models", "v1", "heatmaps", "Button Model Heatmap 2026-09-03.png"))
 
+st.subheader("2. v2 Model Development (Final Generation)")
+st.write("v2 kept v1's exact 57-feature set and dataset split methodology, and only changed the model architecture - tested one variable at a time, always validated across all 3 season-holdout pairs before being trusted:")
+st.markdown("""
+1. **Widened hidden layers** (128/64/32 -> 256/128/64): a real, consistent improvement across all 3 pairs - kept.
+2. **ReLU -> GELU**: regressed rho on all 3 pairs - reverted.
+3. **ReLU -> LeakyReLU**: a mixed result depending on the run, kept as one of 3 final variants rather than a strict replacement.
+""")
+
+st.write("v2 isn't a direct model-for-model upgrade of v1 - it's a curated gallery of the strongest individual runs from that architecture experiment, not one model per held-out pair (two of the three share the 2022-2023 holdout, evaluated with different activation functions, and there's no v2 model at all for 2024-2025). Every v2 model that exists still beat every v1 model on rho, which is why v2 was ultimately kept as the final generation.")
+
+v2_summary_df = pd.DataFrame({
+    "v2 Model": ["Prost", "Schumacher", "Senna"],
+    "Held-Out Seasons": ["2022, 2023", "2020, 2021", "2022, 2023"],
+    "Activation": ["LeakyReLU", "ReLU", "GELU"],
+    "Spearman's Rho": [0.9968, 0.9938, 0.9917],
+    "Mean Absolute Error": [0.24, 0.32, 0.38],
+    "Max Error": [1.0, 2.0, 2.0],
+})
+st.dataframe(v2_summary_df, hide_index=True, width="content")
+
+with st.expander("Prost v2 Heatmap"):
+    st.image(os.path.join("src", "models", "v2", "heatmaps", "Prost Model Heatmap 2026-09-05.png"))
+
+with st.expander("Schumacher v2 Heatmap"):
+    st.image(os.path.join("src", "models", "v2", "heatmaps", "Schumacher Model Heatmap 2026-09-04.png"))
+
+with st.expander("Senna v2 Heatmap"):
+    st.image(os.path.join("src", "models", "v2", "heatmaps", "Senna Model Heatmap 2026-09-05.png"))
+
+st.write("Because v2's 3 keepers each use a different activation function, they don't share one classifier definition - each has its own dedicated `f1_drivers_rank_classifier_{name}.py` file (both under `src/models/v2/` and the dashboard's own self-contained copy) rather than relying on a shared file that keeps changing across experiments. Since activation functions have no learnable parameters, loading the wrong one doesn't error - it silently produces wrong predictions, which is exactly what happened once before this per-model resolution was added.")
+
+st.subheader("3. v3 Experiments (Attempted, Not Pursued)")
+st.write("Three different ideas were tried for a v3, each isolated against the same v2 (widened, LeakyReLU) architecture and validated across all 3 season-holdout pairs, the same discipline that validated v2's width increase. None of them cleared the noise floor - a repeated-run test on an unrelated change earlier in the project measured up to a ~0.013 rho spread between identical runs on the same config, and every v3 delta below falls inside that band:")
+
+v3_summary_df = pd.DataFrame({
+    "Held-Out Pair": ["2020-2021", "2022-2023", "2024-2025"],
+    "v2 Control": [0.9950, 0.9968, 0.9719],
+    "+ Momentum Features": [0.9942, 0.9961, 0.9706],
+    "+ Driver Age": [0.9931, 0.9923, 0.9825],
+    "SHAP-Pruned Features": [0.9960, 0.9900, 0.9696],
+})
+st.dataframe(v3_summary_df, hide_index=True, width="content")
+
+st.markdown("""
+- **Momentum features** (`PositionFormRatio`, `RecentPositionsGained`, `TeammateGapTrend` - rolling-window trend signals for position and teammate gap, distinct from the points-only trend `FormRatio` already tracked): consistently slightly *negative* across all 3 pairs, though small enough to be noise rather than a confirmed regression.
+- **Driver age** (age-at-mid-season, from Ergast birthdate data): mixed - worse on 2 pairs, notably better on 2024-2025 (+0.0106). The most plausible candidate for a *real* small effect, but a single run per pair can't distinguish that from luck.
+- **SHAP-pruned features** (dropping `HasQualifyingData` and the DNF-cause breakdown - `DriverFaultDNFRate`/`MechanicalDNFRate` and their per-round counts - all flagged as the least-influential features by v1's SHAP analysis): also mixed, one pair up, two down. Deliberately did *not* drop the `TeamId_*` one-hot block despite it ranking low individually too - one-hot dummies are mutually correlated by construction, so SHAP dilutes credit across all 10 of them the same way it diluted a correlated points cluster in an earlier (also-abandoned) pruning attempt; dropping the whole block risked losing real car-identity signal, not noise.
+""")
+
+st.write("The honest conclusion: v2's recipe (widened architecture, LeakyReLU, the original 57 features) appears to be close to what this dataset size can support without further hyperparameter/architecture tuning turning into noise-chasing. **v2 is the final model generation this project produced.**")
+
 st.header("A Brief Overview of the Model Training & Testing Methodology")
 st.write("This is a pairwise ranker, not a rank-value regressor. `F1DriversRankClassifier` outputs one scalar 'score' per row; training uses `nn.MarginRankingLoss` on sampled pairs of *different drivers, same year and round*, and scores only get turned into an actual 1-to-n rank at evaluation/prediction time. This is why the model works regardless of how many drivers are in a given season's field - nothing about field size is hardcoded into the ranking mechanism itself.")
 

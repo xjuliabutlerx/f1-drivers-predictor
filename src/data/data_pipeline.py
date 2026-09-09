@@ -10,12 +10,21 @@ import pandas as pd
 import re
 import time
 
+from fastf1.ergast import Ergast
 from fastf1.exceptions import RateLimitExceededError
 
 # -------------------- DOWNLOAD FUNCTIONS --------------------
 def download_schedule(year: int, include_testing: bool = False):
     schedule = fastf1.get_event_schedule(year, include_testing=include_testing)
     return schedule
+
+def download_driver_birthdates(year: int):
+    """One Ergast call per year (negligible against fastf1's 500/h combined limit), returning a
+    {driverId: dateOfBirth} dict for that season's field. driverId matches this project's own
+    DriverId scheme exactly since both ultimately trace back to Ergast's driver identifiers."""
+    driver_info = Ergast().get_driver_info(season=year)
+    driver_info_df = driver_info.content[0] if hasattr(driver_info, "content") else driver_info
+    return dict(zip(driver_info_df["driverId"], pd.to_datetime(driver_info_df["dateOfBirth"])))
 
 # fastf1 self-imposes a hard, sliding-window "500 calls/h across all APIs" limit (see
 # fastf1/req.py) to avoid getting the whole project rate-limited or blocked upstream. A 20s retry
@@ -426,12 +435,12 @@ def calculate_driver_standings_context(training_data_df: pd.DataFrame):
     )
     return training_data_df
 
-FINAL_COLUMNS = ["Year", "DriverId", "TeamId", "Location", "Round", "RoundsCompleted", "RoundsRemaining", \
+FINAL_COLUMNS = ["Year", "DriverId", "TeamId", "Location", "Round", "RoundsCompleted", "RoundsRemaining", "DriverAge", \
                  "CareerSeasonsRaced", "CareerRoundsRaced", "TeamSeasonsWithCurrentTeam", "TeamRoundsWithCurrentTeam", \
                  "PointsEarnedThisRound", "DNFsThisRound", "DriverFaultDNFsThisRound", "MechanicalDNFsThisRound", \
-                 "DriverFaultDNFRate", "MechanicalDNFRate", "TeammateId", "TeammatePointsGap", "BeatTeammateThisRound", \
-                 "BeatTeammateRate", "PositionsGainedThisRound", "AvgPositionsGained", "HasQualifyingData", \
-                 "QualifyingPosition", "AvgQualifyingPosition", "QualifyingGapToTeammate", "GridPenaltyPositions", "PointsLast3Rounds", \
+                 "DriverFaultDNFRate", "MechanicalDNFRate", "TeammateId", "TeammatePointsGap", "TeammateGapTrend", "BeatTeammateThisRound", \
+                 "BeatTeammateRate", "PositionsGainedThisRound", "AvgPositionsGained", "RecentPositionsGained", "PositionFormRatio", \
+                 "HasQualifyingData", "QualifyingPosition", "AvgQualifyingPosition", "QualifyingGapToTeammate", "GridPenaltyPositions", "PointsLast3Rounds", \
                  "DNFsLast3Rounds", "DNFRate", "AvgGridPosition", "AvgPosition", "AvgPointsPerRace", \
                  "TotalPointFinishes", "FormRatio", "Consistency", "TotalPodiums", "TotalPoints", \
                  "ProjectedSeasonTotalPoints", "RelativePointsShare", "CurrentRankAfterRound", "PercentileRankAfterRound", \
@@ -509,6 +518,12 @@ def feature_engineer_all_data(years, incomplete_years=None, min_rounds=3):
     # resuming the old count, since the tenure/familiarity story restarts each time a seat changes.
     team_tenure_state = {}
 
+    # Accumulated across years (not rebuilt per year) - a driver's birthdate never changes, so a
+    # gap in one season's Ergast response (observed for a few 2026 drivers, likely a mirror lag on
+    # the current in-progress season) gets backfilled from whichever other season did have it,
+    # rather than leaving DriverAge NaN for a driver we clearly have data for elsewhere.
+    driver_birthdates_all = {}
+
     for year in years:
         print(f" > Processing data for the {year} season")
         print("   - Calculating final standings...")
@@ -521,6 +536,13 @@ def feature_engineer_all_data(years, incomplete_years=None, min_rounds=3):
 
         total_rounds_in_year = int(all_seasons_data_df.loc[all_seasons_data_df["Year"] == year, "Round"].max())
         driver_ids_this_year = round_summary.loc[round_summary["Year"] == year, "DriverId"].unique().tolist()
+
+        print("   - Fetching driver birthdates for age calculation...")
+        driver_birthdates_all.update(download_driver_birthdates(year))
+        # Reference date is mid-season (not each round's actual date, which isn't tracked anywhere
+        # else in this pipeline) - age genuinely barely moves within one season, so this stays flat
+        # across a driver's rows for the year rather than needing per-round event dates plumbed in.
+        season_midpoint = pd.Timestamp(f"{year}-07-01")
 
         is_incomplete_year = bool(incomplete_years and year in incomplete_years)
         if is_incomplete_year:
@@ -538,6 +560,13 @@ def feature_engineer_all_data(years, incomplete_years=None, min_rounds=3):
             # Calendar-based (not "rounds completed"-based) so it stays correct even when a driver
             # has gaps in their round sequence from a mid-season swap or substitute appearance.
             driver_rounds_df["RoundsRemaining"] = total_rounds_in_year - driver_rounds_df["Round"]
+
+            birthdate = driver_birthdates_all.get(driver_id)
+            if birthdate is None:
+                print(f"     [yellow]NOTE[/yellow]: No birthdate found for {driver_id} - DriverAge will be NaN for this driver-season.")
+                driver_rounds_df["DriverAge"] = np.nan
+            else:
+                driver_rounds_df["DriverAge"] = (season_midpoint - birthdate).days / 365.25
 
             prior_career = career_state.get(driver_id, {"seasons_raced": 0, "rounds_raced": 0})
             driver_rounds_df["CareerSeasonsRaced"] = prior_career["seasons_raced"]
@@ -589,11 +618,25 @@ def feature_engineer_all_data(years, incomplete_years=None, min_rounds=3):
             driver_rounds_df["ProjectedSeasonTotalPoints"] = driver_rounds_df["TotalPoints"] + (rolling_mean_last_5_rounds * driver_rounds_df["RoundsRemaining"])
 
             driver_rounds_df["TeammatePointsGap"] = driver_rounds_df["PointsEarnedThisRound"] - driver_rounds_df["TeammatePointsEarnedThisRound"]
+            # Change in the gap vs. 3 rounds ago - isolates driver-vs-teammate momentum from car
+            # strength, since both drivers share the same car both times. 0 (neutral, "no observed
+            # trend yet") for the first rounds of a season/stint rather than NaN.
+            driver_rounds_df["TeammateGapTrend"] = (driver_rounds_df["TeammatePointsGap"] - driver_rounds_df["TeammatePointsGap"].shift(3)).fillna(0)
             driver_rounds_df["BeatTeammateThisRound"] = driver_rounds_df.apply(compute_beat_teammate, axis=1)
             driver_rounds_df["BeatTeammateRate"] = driver_rounds_df["BeatTeammateThisRound"].expanding().mean()
 
             driver_rounds_df["PositionsGainedThisRound"] = driver_rounds_df["GridPosition"] - driver_rounds_df["Position"]
             driver_rounds_df["AvgPositionsGained"] = driver_rounds_df["PositionsGainedThisRound"].expanding().mean()
+            # Rolling (not expanding) window - distinct signal from AvgPositionsGained above, which
+            # is an all-time average and can't reflect a driver's race-craft heating up or cooling
+            # off recently.
+            driver_rounds_df["RecentPositionsGained"] = driver_rounds_df["PositionsGainedThisRound"].rolling(window=3, min_periods=1).mean()
+
+            # Position-equivalent of FormRatio above. Position is "lower is better", the opposite of
+            # points, so the ratio is inverted (AvgPosition / recent) rather than (recent / AvgPosition)
+            # to keep the same ">1 = trending better" convention as FormRatio.
+            rolling_position_last_3 = driver_rounds_df["Position"].rolling(window=3, min_periods=1).mean()
+            driver_rounds_df["PositionFormRatio"] = driver_rounds_df["AvgPosition"] / (rolling_position_last_3 + 1e-6)
 
             driver_rounds_df["AvgQualifyingPosition"] = driver_rounds_df["QualifyingPosition"].expanding().mean()
             # Positive = qualified better than teammate, matching TeammatePointsGap's "positive is good" convention.

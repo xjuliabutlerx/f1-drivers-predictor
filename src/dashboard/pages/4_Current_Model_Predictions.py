@@ -8,10 +8,10 @@ st.set_page_config(page_title="Current Predictions", page_icon="📈", layout="w
 
 st.title("📈 Current 2026 Drivers' Championship Ranking Predictions")
 
-st.write("These predictions are generated live from the current in-progress-season data, using all 3 of the v1 generation models (Fangio, Clark, and Button). Unlike a pre-baked snapshot, this page re-runs the models against whatever the latest downloaded round is, every time it loads.")
+st.write("These predictions are generated live from the current in-progress-season data, using all 3 of the v2 generation models (Prost, Schumacher, and Senna) - v2 is the final generation this project produced, having beaten every v1 model on rho. See the [Model Naming Scheme](/Model_Naming_Scheme) page for how they compare, and [Model Development & Training](/Model_Development_&_Training) for why a v3 was attempted but not pursued further. Unlike a pre-baked snapshot, this page re-runs the models against whatever the latest downloaded round is, every time it loads.")
 
 PREDICTION_DATA_PATH = os.path.join("data", "clean", "f1_drivers_clean_prediction_data.csv")
-MODELS_DIR = os.path.join("src", "models", "v1", "pretrained_models")
+MODELS_DIR = os.path.join("src", "models", "v2", "pretrained_models")
 
 if not os.path.exists(PREDICTION_DATA_PATH):
     st.error(f"No in-progress-season prediction data found at `{PREDICTION_DATA_PATH}`. Run the data pipeline's `--incomplete-years` step first.")

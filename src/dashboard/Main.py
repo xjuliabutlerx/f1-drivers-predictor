@@ -20,8 +20,9 @@ st.write("The `f1-constructors-predictor` project deliberately chose the Constru
 
 st.header("The Model Generations - In a Nutshell")
 st.markdown("""
-- v1: the current, only generation - a single set of models trained on the full 2018-2026 grid, using a pairwise ranking approach validated by holding out whole seasons rather than individual rows
-- v2/v3: not started yet - the leading candidate for a v2 is dropping the SHAP-flagged low-value features (team one-hot encoding, DNF-cause breakdowns) from the v1 feature set
+- **v1**: the foundational generation - a pairwise ranking approach validated by holding out whole seasons rather than individual rows, on the original 57-feature set
+- **v2 (final generation)**: same features as v1, wider hidden layers - a validated win, tested in isolation - plus an activation-function experiment (ReLU vs. GELU vs. LeakyReLU). Every v2 model beat every v1 model on rho
+- **v3**: attempted, not pursued - momentum features, a driver-age feature, and a SHAP-driven feature prune were each tested in isolation against the same v2 architecture, and none produced a consistent improvement across all 3 held-out season pairs. See [Model Development & Training](/Model_Development_&_Training) for the full results
 """)
 
 st.header("Tech Stack")

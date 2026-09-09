@@ -1,6 +1,6 @@
 from .f1_dataset import F1DriversDataset
-from .f1_drivers_rank_classifier import F1DriversRankClassifier
 
+import importlib
 import os
 import pandas as pd
 import torch
@@ -13,6 +13,27 @@ def get_device():
     else:
         return torch.device("cpu")
 
+def resolve_classifier_class(model_path: str):
+    """Prefers a model-specific f1_drivers_rank_classifier_{name}.py (e.g. schumacher_model.pt ->
+    f1_drivers_rank_classifier_schumacher.py) over the shared f1_drivers_rank_classifier.py - same
+    fix as src/models/predict.py's resolve_classifier_class, needed here for the same reason: v2's
+    3 keepers (Prost/Schumacher/Senna) each use a different activation function, so loading all of
+    them through one shared class would silently produce wrong predictions for 2 of the 3 (since
+    activation functions have no learnable parameters, load_state_dict() succeeds even when the
+    architecture doesn't match). Falls back to the shared file for models that don't have a
+    dedicated one (all of v1, which never diverged from a single shared architecture)."""
+    model_name = os.path.basename(model_path)
+    if model_name.endswith("_model.pt"):
+        model_name = model_name[:-len("_model.pt")]
+        try:
+            module = importlib.import_module(f"pages.utils.f1_drivers_rank_classifier_{model_name}")
+            return module.F1DriversRankClassifier
+        except ModuleNotFoundError:
+            pass
+
+    module = importlib.import_module("pages.utils.f1_drivers_rank_classifier")
+    return module.F1DriversRankClassifier
+
 def predict(model_path: str, dataset_df: pd.DataFrame, feature_cols: list, device: torch.device):
     idx_final_rank = dataset_df.sort_values(["DriverId", "RoundsCompleted"]).groupby(["DriverId"])["RoundsCompleted"].idxmax()
     prediction_df = dataset_df.loc[idx_final_rank].copy()
@@ -20,7 +41,8 @@ def predict(model_path: str, dataset_df: pd.DataFrame, feature_cols: list, devic
 
     X_pred = torch.tensor(prediction_df[feature_cols].values, dtype=torch.float32)
 
-    model = F1DriversRankClassifier(input_dim=X_pred.shape[1], output_dim=1).to(device)
+    classifier_class = resolve_classifier_class(model_path)
+    model = classifier_class(input_dim=X_pred.shape[1], output_dim=1).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
