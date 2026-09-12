@@ -16,22 +16,14 @@ def driver_surname(driver_id: str) -> str:
     stays correct as new drivers join the grid."""
     return driver_id.split("_")[-1].capitalize()
 
-# data/ is gitignored (it's regenerated locally by src/data/data_pipeline.py), so a Streamlit Cloud
-# deployment never has it. It only gets whatever's actually committed to the repo. This path is
-# checked first so a local checkout with the pipeline already run stays live and current; a
-# deployed instance without data/ falls back to the committed snapshot below, which only updates
-# when someone re-runs the pipeline locally and re-copies/commits it.
-LIVE_PREDICTION_DATA_PATH = os.path.join("data", "clean", "f1_drivers_clean_prediction_data.csv")
+# LIVE_PREDICTION_DATA_PATH = os.path.join("data", "clean", "f1_drivers_clean_prediction_data.csv")
 SNAPSHOT_PREDICTION_DATA_PATH = os.path.join("src", "dashboard", "data_snapshot", "f1_drivers_clean_prediction_data.csv")
 MODELS_DIR = os.path.join("src", "models", "v2", "pretrained_models")
 
-if os.path.exists(LIVE_PREDICTION_DATA_PATH):
-    PREDICTION_DATA_PATH = LIVE_PREDICTION_DATA_PATH
-elif os.path.exists(SNAPSHOT_PREDICTION_DATA_PATH):
+if os.path.exists(SNAPSHOT_PREDICTION_DATA_PATH):
     PREDICTION_DATA_PATH = SNAPSHOT_PREDICTION_DATA_PATH
-    st.info(f"Using the bundled data snapshot ({SNAPSHOT_PREDICTION_DATA_PATH}) since no locally downloaded data was found. This snapshot only updates when someone re-runs the data pipeline and re-commits it, so it may lag behind the actual latest round.")
 else:
-    st.error(f"No in-progress-season prediction data found at `{LIVE_PREDICTION_DATA_PATH}` or the bundled snapshot. Run the data pipeline's `--incomplete-years` step first.")
+    st.error(f"No in-progress-season prediction data found at `{SNAPSHOT_PREDICTION_DATA_PATH}` or the bundled snapshot.")
     st.stop()
 
 results_df = run_all_models(PREDICTION_DATA_PATH, MODELS_DIR)
