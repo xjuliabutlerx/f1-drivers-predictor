@@ -13,7 +13,7 @@ st.markdown("""
 - The most precise and accurate of the v1 generation
 - Sharp final-season accuracy, with the smallest maximum error of the three models
 - Held out on 2020-2021, rho 0.9908
-- Juan Manuel Fangio holds the highest win percentage of any driver in Formula 1 history, a fitting name for the sharpest model of this generation, even if it's since been surpassed by v2's own Prost model on the very same holdout seasons (rho 0.9938)
+- Juan Manuel Fangio holds the highest win percentage of any driver in Formula 1 history. That makes him a fitting name for the sharpest model of this generation, even though v2's own Prost model has since surpassed it on the very same holdout seasons (rho 0.9938).
 """)
 
 st.subheader("Clark 🇬🇧")
@@ -21,7 +21,7 @@ st.markdown("""
 - Steady, consistent accuracy gains all season long, with no dramatic swings up or down
 - Strong overall, but defined by its evenness rather than any single standout jump in form
 - Held out on 2022-2023, rho 0.9881
-- Jim Clark's reputation was for an almost effortless, natural smoothness: dominant without ever looking like he was trying hard, which fits this model's steady, unremarkable-but-solid consistency
+- Jim Clark's reputation was for an almost effortless, natural smoothness. He was dominant without ever looking like he was trying hard. That suits this model's steady, unremarkable-but-solid consistency.
 """)
 
 st.subheader("Button 🇬🇧")
@@ -29,7 +29,7 @@ st.markdown("""
 - The most volatile of the v1 generation, noticeably rougher early in a season, with the largest swings in error
 - Still fundamentally strong by the end of a season, but carries a wider margin of error throughout than the other two
 - Held out on 2024-2025, rho 0.9529
-- Jenson Button was known for staying composed and clawing back a strong result even after a rough start, most famously winning the 2011 Canadian Grand Prix from last place after a chaotic, rain-delayed race. A fitting name for a model that's roughest early in a season but still lands fundamentally strong by the end
+- Jenson Button was known for staying composed and clawing back a strong result even after a rough start. He famously won the 2011 Canadian Grand Prix from last place after a chaotic, rain-delayed race. That makes him an apt name for a model that's roughest early in a season but still lands fundamentally strong by the end
 """)
 
 st.header("v2")
@@ -40,19 +40,19 @@ st.subheader("Prost 🇫🇷")
 st.markdown("""
 - The standout of the entire v2 generation: the highest rho (0.9968), lowest error, and tightest max error (off by at most 1 position) of any model produced so far
 - Held out on 2022-2023, using LeakyReLU activation
-- Just as Alain Prost, "The Professor", built his reputation on calculated, low-risk, mistake-minimizing racing, this model is the most surgical of anything this project has produced, especially fitting for the single best result so far
+- Alain Prost, nicknamed "The Professor", built his reputation on calculated, low-risk, mistake-minimizing racing. This model is the most surgical of anything this project has produced, which makes the name especially fitting for its single best result so far.
 """)
 
 st.subheader("Schumacher 🇩🇪")
 st.markdown("""
 - The strongest all-around result among the "standard" v2 runs (tight, clean, low error), but not the most extreme standout of the generation
 - Held out on 2020-2021, using the original ReLU activation, rho 0.9938, beating v1's Fangio model on the very same seasons
-- Mirrors Michael Schumacher's relentless, methodical consistency: a strong, dependable result without being the headline of the generation
+- This mirrors Michael Schumacher's relentless, methodical consistency. It's a strong, dependable result without being the headline of the generation.
 """)
 
 st.subheader("Senna 🇧🇷")
 st.markdown("""
 - The steadiest, most solid of the v2 generation rather than a standout, still excellent by any absolute measure (rho 0.9917), just the least remarkable relative to the other two
 - Held out on 2022-2023, using GELU activation. The only difference from Prost is the activation function, which is what makes the gap between them notable
-- Like Ayrton Senna, this name usually evokes genius-level highs. Here it's attached to the most comparatively modest of the three v2 results, a reminder that these names track overall project standing, not a perfect behavioral match every time
+- Ayrton Senna's name usually evokes genius-level highs. Here, it's attached to the most comparatively modest of the three v2 results. That's a reminder that these names track overall project standing, not a perfect behavioral match every time.
 """)
